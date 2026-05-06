@@ -1,0 +1,238 @@
+//! IO / scene / 基础投影相关测试。
+//!
+//! 这些测试覆盖的不是“完整文件解析”，
+//! 而是一些非常适合在单元测试层锁住的基础契约：
+//! - 默认配置是否存在
+//! - 空场景行为是否合理
+//! - 错误路径是否会给出清晰报错
+//! - 基础投影是否落在画布内
+//! - scene 是否能正确暴露 layer 与 shape 元信息
+
+use flayout_wgpu::{
+    app::{
+        LoadState, fill_missing_layer_hatch_styles, recommended_initial_hierarchy_level_range,
+    },
+    camera::Camera2D,
+    config::DEFAULT_LAYOUT_PATH,
+    io::load_layout_scene,
+    renderer::geometry::{HatchStylePreset, project_points},
+    scene::{Bounds, LayerId, RectShape, Scene},
+};
+use glam::Vec2;
+use std::collections::BTreeMap;
+
+/// 默认版图路径常量必须存在，否则应用启动时没有任何加载目标。
+#[test]
+fn default_layout_path_constant_is_available() {
+    assert!(!DEFAULT_LAYOUT_PATH.is_empty());
+}
+
+/// 空场景的统计和 bounds 应该是干净的。
+#[test]
+fn empty_scene_reports_zero_shapes() {
+    let scene = Scene::empty();
+    assert_eq!(scene.stats().shape_count, 0);
+    assert!(scene.bounds().is_none());
+}
+
+/// 明显错误的路径应该走到缺失文件错误，而不是 panic。
+#[test]
+fn invalid_path_returns_missing_file_error() {
+    let err = load_layout_scene("/definitely/not/here/demo.gds").unwrap_err();
+    assert!(err.to_string().contains("does not exist"));
+}
+
+/// 经过 fit 后，一个简单矩形的四个角点都应该落在画布范围内。
+#[test]
+fn geometry_projection_keeps_points_in_canvas() {
+    let shape = RectShape::rectangle(
+        LayerId {
+            layer: 1,
+            datatype: 0,
+        },
+        Bounds::new(0.0, 0.0, 10.0, 20.0),
+    );
+    let scene = Scene::from_shapes(vec![shape.clone()]);
+
+    let mut camera = Camera2D::new();
+    camera.fit_bounds(
+        scene.bounds().expect("scene bounds"),
+        Vec2::new(100.0, 100.0),
+    );
+    let points = project_points(&shape, &camera, Vec2::ZERO);
+    assert_eq!(points.len(), 4);
+    assert!(
+        points
+            .iter()
+            .all(|point| point.x >= 0.0 && point.x <= 100.0)
+    );
+    assert!(
+        points
+            .iter()
+            .all(|point| point.y >= 0.0 && point.y <= 100.0)
+    );
+}
+
+/// 加载失败状态应该能把错误信息透传给 UI。
+#[test]
+fn failed_load_state_exposes_error_text() {
+    let state = LoadState::Failed("parse failed".to_string());
+    assert!(state.summary().contains("parse failed"));
+}
+
+/// scene 输出的 layer 列表应该：
+/// - 去重
+/// - 排序
+#[test]
+fn scene_exposes_unique_sorted_layers() {
+    let scene = Scene::from_shapes(vec![
+        RectShape::rectangle(
+            LayerId {
+                layer: 70,
+                datatype: 31,
+            },
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+        ),
+        RectShape::rectangle(
+            LayerId {
+                layer: 1,
+                datatype: 2,
+            },
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+        ),
+        RectShape::rectangle(
+            LayerId {
+                layer: 1,
+                datatype: 2,
+            },
+            Bounds::new(2.0, 2.0, 3.0, 3.0),
+        ),
+    ]);
+
+    assert_eq!(
+        scene.layer_ids(),
+        vec![
+            LayerId {
+                layer: 1,
+                datatype: 2
+            },
+            LayerId {
+                layer: 70,
+                datatype: 31
+            },
+        ]
+    );
+}
+
+/// path 类型图元要能保留世界坐标线宽，供 renderer 在不同 zoom 下换算屏幕线宽。
+#[test]
+fn path_shape_can_preserve_world_stroke_width() {
+    let shape = RectShape::polyline(
+        LayerId {
+            layer: 1,
+            datatype: 1,
+        },
+        vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0)],
+        2.5,
+    );
+
+    assert_eq!(shape.stroke_width_world, Some(2.5));
+    assert!(!shape.closed);
+}
+
+#[test]
+fn scene_can_filter_shapes_by_hierarchy_level_range() {
+    let mut root = RectShape::rectangle(
+        LayerId { layer: 1, datatype: 0 },
+        Bounds::new(0.0, 0.0, 10.0, 10.0),
+    );
+    root.hierarchy_level = 0;
+    let mut child = RectShape::rectangle(
+        LayerId { layer: 2, datatype: 0 },
+        Bounds::new(20.0, 20.0, 30.0, 30.0),
+    );
+    child.hierarchy_level = 2;
+    let scene = Scene::from_shapes(vec![root, child]);
+
+    let filtered = scene.filtered_by_hierarchy_range(0, 1);
+    assert_eq!(filtered.stats().shape_count, 1);
+    assert_eq!(filtered.shapes()[0].layer, LayerId { layer: 1, datatype: 0 });
+    assert_eq!(scene.max_hierarchy_level(), 2);
+}
+
+#[test]
+fn large_scene_defaults_to_half_hierarchy_depth() {
+    let mut shapes = Vec::new();
+    for index in 0..60_000usize {
+        let mut shape = RectShape::rectangle(
+            LayerId { layer: 1, datatype: 0 },
+            Bounds::new(index as f32, 0.0, index as f32 + 1.0, 1.0),
+        );
+        shape.hierarchy_level = if index % 3 == 0 { 5 } else { 0 };
+        shapes.push(shape);
+    }
+    let scene = Scene::from_shapes(shapes);
+
+    assert_eq!(recommended_initial_hierarchy_level_range(&scene), (0, 2));
+}
+
+/// 图层 hatch preset 的默认值不是“按缺失项轮流分配”，
+/// 而是严格按 scene 排序后的绝对位置决定。
+/// 这样即使中间某层已经有显式样式，其他层的默认结果也仍然稳定可预测。
+#[test]
+fn missing_layer_hatch_styles_receive_predictable_alternating_defaults() {
+    let scene = Scene::from_shapes(vec![
+        RectShape::rectangle(
+            LayerId {
+                layer: 70,
+                datatype: 31,
+            },
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+        ),
+        RectShape::rectangle(
+            LayerId {
+                layer: 1,
+                datatype: 2,
+            },
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+        ),
+        RectShape::rectangle(
+            LayerId {
+                layer: 5,
+                datatype: 0,
+            },
+            Bounds::new(2.0, 2.0, 3.0, 3.0),
+        ),
+    ]);
+    let mut hatch_styles = BTreeMap::from([(
+        LayerId {
+            layer: 5,
+            datatype: 0,
+        },
+        HatchStylePreset::Cross,
+    )]);
+
+    fill_missing_layer_hatch_styles(&scene, &mut hatch_styles);
+
+    assert_eq!(
+        hatch_styles.get(&LayerId {
+            layer: 1,
+            datatype: 2,
+        }),
+        Some(&HatchStylePreset::LeftDiagonal)
+    );
+    assert_eq!(
+        hatch_styles.get(&LayerId {
+            layer: 5,
+            datatype: 0,
+        }),
+        Some(&HatchStylePreset::Cross)
+    );
+    assert_eq!(
+        hatch_styles.get(&LayerId {
+            layer: 70,
+            datatype: 31,
+        }),
+        Some(&HatchStylePreset::LeftDiagonal)
+    );
+}

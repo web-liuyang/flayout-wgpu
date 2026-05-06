@@ -1,0 +1,46 @@
+[package]
+name = "flayout-wgpu"
+version = "0.1.0"
+edition = "2024"
+default-run = "flayout-wgpu"
+
+[profile.release]
+# 优化级别：2: 平衡性能与体积; 3: 极致性能; "z": 极致体积
+opt-level = 2
+# 链接时优化："thin": 平衡编译时间与优化效果; "fat": 彻底优化，但编译慢
+lto = "thin"
+# 代码生成单元数，一般为1能更好地优化，但会增加编译时间
+codegen-units = 1
+# Panic时直接终止，减少二进制体积
+panic = "abort"
+# 剥离调试信息，减小体积
+strip = true
+
+[lib]
+name = "flayout_wgpu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flayout-wgpu"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+directories = "5.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+env_logger = "0.11"
+egui = "0.33.3"
+egui-wgpu = "0.33.3"
+egui-winit = "0.33.3"
+glam = "0.30"
+laykit = "0.0.3"
+log = "0.4"
+pollster = "0.4"
+rfd = "0.15"
+thiserror = "2.0"
+wgpu = "27.0.1"
+winit = "0.30.13"
+
+[dev-dependencies]
+approx = "0.5"
