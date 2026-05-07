@@ -201,9 +201,10 @@
 - 前面几层更像“渲染器内部怎么少做无意义工作”
 - `hierarchy level range` 更像“从业务语义上直接减小 scene”
 
-当前实现是：
-- `full_scene`：当前 root cell 的完整展开结果
-- `scene`：`full_scene` 按 `min/max level` 过滤后的运行场景
+当前新的 `GDS` 路径实现是：
+- `LayoutBundle`：当前 root cell 的分层 source
+- `view_builder`：按 `min/max level` 只展开需要的层级
+- `scene`：真正送给 renderer 的临时 workset
 
 ### 为什么它对性能有帮助
 
@@ -212,7 +213,7 @@
 - 第 1 层子实例带来了什么
 - 到第 3 层开始为什么画面突然复杂
 
-那没必要一上来把完整层级全部送进 renderer。
+那没必要一上来就把完整层级全部展开成常驻扁平场景。
 
 这时直接把 `max level` 收小，收益是立刻发生的：
 - shape 数减少
@@ -232,6 +233,29 @@
 - renderer 仍然只消费一个普通 `Scene`
 - 现有索引、tile cache、统计都直接复用
 - 复杂度下降更早发生
+- 更深层的 hierarchy 如果当前没请求到，就不会整份常驻内存
+
+### 这一层对大文件内存的直接影响
+
+这轮重构后，项目已经能把：
+- “分层 source”
+- “当前 workset”
+
+这两个概念拆开。
+
+对 `example_mzi_perf.gds / MziArray`，当前 `memory_probe` 的一个真实例子是：
+- root 最大层级：`5`
+- 当只展开 `0..2` 时：
+  - `shape_count = 230016`
+  - `total_points = 1150080`
+
+而旧的全量扁平探针曾经是：
+- `shape_count = 2274428`
+- `total_points = 55362608`
+
+这组数字最能说明：
+- 这层优化不是“让 renderer 稍微少画一点”
+- 而是直接改变了常驻数据本体的规模
 
 ### 初始化为什么不是总显示全部层级
 

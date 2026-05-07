@@ -14,12 +14,21 @@ use flayout_wgpu::{
     },
     camera::Camera2D,
     config::DEFAULT_LAYOUT_PATH,
-    io::load_layout_scene,
+    io::{load_layout_hierarchy_bundle, load_layout_scene},
+    layout::LayoutRepetition,
     renderer::geometry::{HatchStylePreset, project_points},
     scene::{Bounds, LayerId, RectShape, Scene},
 };
 use glam::Vec2;
+use laykit::{
+    ArrayRef, Boundary, GDSBox, GDSElement, GDSIIFile, GDSStructure, GDSTime, GPath, StructRef,
+};
 use std::collections::BTreeMap;
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// 默认版图路径常量必须存在，否则应用启动时没有任何加载目标。
 #[test]
@@ -235,4 +244,189 @@ fn missing_layer_hatch_styles_receive_predictable_alternating_defaults() {
         }),
         Some(&HatchStylePreset::LeftDiagonal)
     );
+}
+
+/// 分层 GDS 加载路径应该保留：
+/// - root cell 发现
+/// - `StructRef` 实例关系
+/// - `ArrayRef` 的规则阵列语义
+/// - path 的局部点列和线宽
+#[test]
+fn gds_loader_builds_hierarchical_layout() {
+    let path = write_temp_gds_file(sample_hierarchical_gds(), "hierarchical-layout");
+    let bundle = load_layout_hierarchy_bundle(path.to_str().expect("utf8 path"))
+        .expect("hierarchical GDS bundle");
+
+    let root_names: Vec<_> = bundle
+        .views()
+        .iter()
+        .map(|view| view.metadata().name().to_string())
+        .collect();
+    assert_eq!(root_names, vec!["top".to_string(), "grid".to_string()]);
+
+    let leaf = bundle
+        .cells()
+        .values()
+        .find(|cell| cell.name() == "leaf")
+        .expect("leaf cell");
+    assert_eq!(leaf.local_shapes().len(), 2);
+    assert_eq!(leaf.local_instance_count(), 0);
+    assert_eq!(
+        leaf.local_shapes()[0].points(),
+        &[
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(10.0, 20.0),
+            Vec2::new(0.0, 20.0),
+            Vec2::new(0.0, 0.0),
+        ]
+    );
+    assert_eq!(leaf.local_shapes()[1].stroke_width(), Some(6.0));
+    assert_eq!(
+        leaf.local_shapes()[1].points(),
+        &[Vec2::new(5.0, 5.0), Vec2::new(35.0, 5.0), Vec2::new(35.0, 15.0)]
+    );
+
+    let top = bundle
+        .cells()
+        .values()
+        .find(|cell| cell.name() == "top")
+        .expect("top cell");
+    assert_eq!(top.local_shapes().len(), 0);
+    assert_eq!(top.local_instance_count(), 1);
+    let top_instance = &top.instances()[0];
+    assert_eq!(top_instance.transform().translation, Vec2::new(100.0, 200.0));
+    assert_eq!(top_instance.transform().rotation_degrees, 0.0);
+    assert_eq!(top_instance.transform().magnification, 1.0);
+    assert!(!top_instance.transform().mirrored_x);
+    assert!(top_instance.repetition().is_none());
+
+    let grid = bundle
+        .cells()
+        .values()
+        .find(|cell| cell.name() == "grid")
+        .expect("grid cell");
+    assert_eq!(grid.local_shapes().len(), 1);
+    assert_eq!(grid.local_instance_count(), 1);
+    let array_instance = &grid.instances()[0];
+    assert_eq!(array_instance.transform().translation, Vec2::new(20.0, 30.0));
+    assert_eq!(
+        array_instance.repetition(),
+        Some(&LayoutRepetition::regular_grid(
+            3,
+            2,
+            Vec2::new(40.0, 0.0),
+            Vec2::new(0.0, 50.0),
+        ))
+    );
+
+    fs::remove_file(path).ok();
+}
+
+fn sample_hierarchical_gds() -> GDSIIFile {
+    GDSIIFile {
+        version: 600,
+        modification_time: sample_time(),
+        access_time: sample_time(),
+        library_name: "hier".to_string(),
+        units: (1e-6, 1e-9),
+        reflibs: Vec::new(),
+        fonts: Vec::new(),
+        generations: None,
+        attrtable: None,
+        structures: vec![
+            GDSStructure {
+                name: "leaf".to_string(),
+                creation_time: sample_time(),
+                modification_time: sample_time(),
+                strclass: None,
+                elements: vec![
+                    GDSElement::Boundary(Boundary {
+                        layer: 1,
+                        datatype: 0,
+                        xy: vec![(0, 0), (10, 0), (10, 20), (0, 20), (0, 0)],
+                        elflags: None,
+                        plex: None,
+                        properties: Vec::new(),
+                    }),
+                    GDSElement::Path(GPath {
+                        layer: 2,
+                        datatype: 1,
+                        pathtype: 0,
+                        width: Some(6),
+                        bgnextn: None,
+                        endextn: None,
+                        xy: vec![(5, 5), (35, 5), (35, 15)],
+                        elflags: None,
+                        plex: None,
+                        properties: Vec::new(),
+                    }),
+                ],
+            },
+            GDSStructure {
+                name: "top".to_string(),
+                creation_time: sample_time(),
+                modification_time: sample_time(),
+                strclass: None,
+                elements: vec![GDSElement::StructRef(StructRef {
+                    sname: "leaf".to_string(),
+                    xy: (100, 200),
+                    strans: None,
+                    elflags: None,
+                    plex: None,
+                    properties: Vec::new(),
+                })],
+            },
+            GDSStructure {
+                name: "grid".to_string(),
+                creation_time: sample_time(),
+                modification_time: sample_time(),
+                strclass: None,
+                elements: vec![
+                    GDSElement::Box(GDSBox {
+                        layer: 9,
+                        boxtype: 0,
+                        xy: vec![(0, 0), (20, 0), (20, 20), (0, 20), (0, 0)],
+                        elflags: None,
+                        plex: None,
+                        properties: Vec::new(),
+                    }),
+                    GDSElement::ArrayRef(ArrayRef {
+                        sname: "leaf".to_string(),
+                        columns: 3,
+                        rows: 2,
+                        xy: vec![(20, 30), (140, 30), (20, 130)],
+                        strans: None,
+                        elflags: None,
+                        plex: None,
+                        properties: Vec::new(),
+                    }),
+                ],
+            },
+        ],
+    }
+}
+
+fn sample_time() -> GDSTime {
+    GDSTime {
+        year: 2026,
+        month: 5,
+        day: 7,
+        hour: 12,
+        minute: 0,
+        second: 0,
+    }
+}
+
+fn write_temp_gds_file(file: GDSIIFile, prefix: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "flayout-wgpu-{prefix}-{}-{stamp}.gds",
+        std::process::id()
+    ));
+    file.write_to_file(&path).expect("write temp gds");
+    path
 }

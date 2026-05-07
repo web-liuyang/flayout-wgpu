@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use glam::Vec2;
 use laykit::{
@@ -27,6 +28,10 @@ use laykit::{
 };
 
 use crate::error::AppError;
+use crate::layout::{
+    LayoutBundle, LayoutCell, LayoutCellId, LayoutInstance, LayoutRepetition, LayoutShape,
+    LayoutTransform, LayoutView, LayoutViewMetadata,
+};
 use crate::scene::{Bounds, LayerId, RectShape, Scene, SceneBundle, SceneView};
 
 /// 一个非常轻量的 2D 仿射变换表示。
@@ -47,6 +52,30 @@ struct Transform2D {
     basis_x: Vec2,
     basis_y: Vec2,
     translation: Vec2,
+}
+
+/// GDS 分层加载阶段的临时 cell 表示。
+///
+/// 这里先把一个 structure 的“本地图形”和“本地实例引用”拆开保存，
+/// 等所有 structure 都扫完之后，再统一补全实例 footprint。
+#[derive(Debug, Clone)]
+struct RawGdsCell {
+    id: LayoutCellId,
+    name: String,
+    local_shapes: Vec<LayoutShape>,
+    local_instances: Vec<RawGdsInstance>,
+}
+
+/// GDS 分层加载阶段的临时实例表示。
+///
+/// `target_name` 先保留字符串，是因为第一遍扫描 structure 时，
+/// 还不一定已经拿到了目标 cell 的 bounds。
+#[derive(Debug, Clone)]
+struct RawGdsInstance {
+    target_cell_id: LayoutCellId,
+    target_name: String,
+    transform: LayoutTransform,
+    repetition: Option<LayoutRepetition>,
 }
 
 impl Transform2D {
@@ -176,6 +205,16 @@ pub fn load_gds(path: &Path) -> Result<SceneBundle, AppError> {
     build_gds_scene_bundle(&gds)
 }
 
+/// 从 GDS 文件加载分层 `LayoutBundle`。
+///
+/// 这是分层内存架构重构的第一步：
+/// - 不再把整个层级树先扁平展开成 `Scene`
+/// - 先保留每个 structure 的本地图形和实例引用
+pub fn load_gds_layout_bundle(path: &Path) -> Result<LayoutBundle, AppError> {
+    let gds = GDSIIFile::read_from_file(path).map_err(|err| AppError::Parse(err.to_string()))?;
+    build_gds_layout_bundle(&gds)
+}
+
 /// 从 OASIS 文件加载场景集合。
 pub fn load_oasis(path: &Path) -> Result<SceneBundle, AppError> {
     let oasis = OASISFile::read_from_file(path).map_err(|err| AppError::Parse(err.to_string()))?;
@@ -195,32 +234,7 @@ fn build_gds_scene_bundle(gds: &GDSIIFile) -> Result<SceneBundle, AppError> {
         .map(|structure| (structure.name.as_str(), structure))
         .collect();
 
-    let mut referenced = HashSet::new();
-    for structure in &gds.structures {
-        for element in &structure.elements {
-            match element {
-                GDSElement::StructRef(sref) => {
-                    referenced.insert(sref.sname.as_str());
-                }
-                GDSElement::ArrayRef(aref) => {
-                    referenced.insert(aref.sname.as_str());
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let root_structures: Vec<&GDSStructure> = gds
-        .structures
-        .iter()
-        .filter(|structure| !referenced.contains(structure.name.as_str()))
-        .collect();
-    let source_structures = if root_structures.is_empty() {
-        // 某些数据可能没有明显 root，这里回退为“全部结构都可选”。
-        gds.structures.iter().collect()
-    } else {
-        root_structures
-    };
+    let source_structures = root_gds_structures(gds);
 
     let mut views = Vec::new();
     for structure in source_structures {
@@ -236,11 +250,93 @@ fn build_gds_scene_bundle(gds: &GDSIIFile) -> Result<SceneBundle, AppError> {
         )?;
         views.push(SceneView {
             name: structure.name.clone(),
-            scene: Scene::from_shapes(shapes),
+            scene: Arc::new(Scene::from_shapes(shapes)),
         });
     }
 
     Ok(SceneBundle::new(views))
+}
+
+/// 从 GDS 内容构造分层 `LayoutBundle`。
+///
+/// 这里不做 eager flatten：
+/// - 每个 structure 变成一个 `LayoutCell`
+/// - 本地 `Boundary / Box / Path` 保留为 `LayoutShape`
+/// - `StructRef / ArrayRef` 保留为 `LayoutInstance`
+fn build_gds_layout_bundle(gds: &GDSIIFile) -> Result<LayoutBundle, AppError> {
+    let cell_ids: HashMap<&str, LayoutCellId> = gds
+        .structures
+        .iter()
+        .enumerate()
+        .map(|(index, structure)| (structure.name.as_str(), LayoutCellId::new(index as u64 + 1)))
+        .collect();
+
+    let raw_cells: HashMap<&str, RawGdsCell> = gds
+        .structures
+        .iter()
+        .map(|structure| {
+            let cell_id = *cell_ids
+                .get(structure.name.as_str())
+                .expect("cell id already assigned");
+            let raw_cell = RawGdsCell {
+                id: cell_id,
+                name: structure.name.clone(),
+                local_shapes: collect_local_gds_shapes(structure),
+                local_instances: collect_local_gds_instances(structure, &cell_ids)?,
+            };
+            Ok((structure.name.as_str(), raw_cell))
+        })
+        .collect::<Result<_, AppError>>()?;
+
+    let mut bounds_cache = HashMap::new();
+    for structure in &gds.structures {
+        let mut stack = vec![structure.name.as_str()];
+        resolve_raw_cell_bounds(
+            structure.name.as_str(),
+            &raw_cells,
+            &mut bounds_cache,
+            &mut stack,
+        )?;
+    }
+
+    let cells = gds
+        .structures
+        .iter()
+        .map(|structure| {
+            let raw = raw_cells
+                .get(structure.name.as_str())
+                .expect("raw cell exists for every structure");
+            let instances = raw
+                .local_instances
+                .iter()
+                .map(|instance| {
+                    let target_bounds = bounds_cache
+                        .get(instance.target_name.as_str())
+                        .copied()
+                        .flatten();
+                    raw_instance_to_layout_instance(instance, target_bounds)
+                })
+                .collect();
+            Arc::new(LayoutCell::new(
+                raw.id,
+                raw.name.clone(),
+                raw.local_shapes.clone(),
+                instances,
+            ))
+        })
+        .collect();
+
+    let views = root_gds_structures(gds)
+        .into_iter()
+        .map(|structure| {
+            let root_cell_id = *cell_ids
+                .get(structure.name.as_str())
+                .expect("root cell id exists");
+            LayoutView::new(LayoutViewMetadata::new(structure.name.clone(), root_cell_id))
+        })
+        .collect();
+
+    LayoutBundle::new(cells, views).map_err(|err| AppError::Parse(format!("{err:?}")))
 }
 
 /// 从 OASIS 内容构造 `SceneBundle`。
@@ -285,11 +381,387 @@ fn build_oasis_scene_bundle(oasis: &OASISFile) -> Result<SceneBundle, AppError> 
         )?;
         views.push(SceneView {
             name: cell.name.clone(),
-            scene: Scene::from_shapes(shapes),
+            scene: Arc::new(Scene::from_shapes(shapes)),
         });
     }
 
     Ok(SceneBundle::new(views))
+}
+
+/// 找出 GDS 中应该暴露给 UI 的 root structures。
+///
+/// 规则与旧扁平 loader 保持一致：
+/// - 优先选择“没有被别的 structure 引用”的 structure
+/// - 如果所有 structure 都被引用，则回退成“全部都可选”
+fn root_gds_structures(gds: &GDSIIFile) -> Vec<&GDSStructure> {
+    let mut referenced = HashSet::new();
+    for structure in &gds.structures {
+        for element in &structure.elements {
+            match element {
+                GDSElement::StructRef(sref) => {
+                    referenced.insert(sref.sname.as_str());
+                }
+                GDSElement::ArrayRef(aref) => {
+                    referenced.insert(aref.sname.as_str());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let roots: Vec<&GDSStructure> = gds
+        .structures
+        .iter()
+        .filter(|structure| !referenced.contains(structure.name.as_str()))
+        .collect();
+
+    if roots.is_empty() {
+        gds.structures.iter().collect()
+    } else {
+        roots
+    }
+}
+
+/// 收集一个 structure 自己直接拥有的本地图形。
+fn collect_local_gds_shapes(structure: &GDSStructure) -> Vec<LayoutShape> {
+    let mut shapes = Vec::new();
+
+    for element in &structure.elements {
+        match element {
+            GDSElement::Boundary(boundary) => {
+                if let Some(shape) = layout_shape_from_boundary(boundary) {
+                    shapes.push(shape);
+                }
+            }
+            GDSElement::Box(gds_box) => {
+                if let Some(shape) = layout_shape_from_gds_box(gds_box) {
+                    shapes.push(shape);
+                }
+            }
+            GDSElement::Path(path) => {
+                if let Some(shape) = layout_shape_from_gds_path(path) {
+                    shapes.push(shape);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    shapes
+}
+
+/// 收集一个 structure 自己直接拥有的实例引用。
+fn collect_local_gds_instances(
+    structure: &GDSStructure,
+    cell_ids: &HashMap<&str, LayoutCellId>,
+) -> Result<Vec<RawGdsInstance>, AppError> {
+    let mut instances = Vec::new();
+
+    for element in &structure.elements {
+        match element {
+            GDSElement::StructRef(sref) => {
+                instances.push(raw_instance_from_struct_ref(sref, cell_ids)?);
+            }
+            GDSElement::ArrayRef(aref) => {
+                instances.push(raw_instance_from_array_ref(aref, cell_ids)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(instances)
+}
+
+/// 递归解析一个 raw cell 的完整局部 bounds。
+///
+/// 这里的“完整”指的是：
+/// - 自己直接拥有的 shapes
+/// - 自己直接引用的 child instances footprint
+///
+/// 这样 Task 3 的按需展开器以后就能直接拿这些 bounds 做层级裁剪。
+fn resolve_raw_cell_bounds<'a>(
+    cell_name: &'a str,
+    raw_cells: &'a HashMap<&'a str, RawGdsCell>,
+    cache: &mut HashMap<&'a str, Option<Bounds>>,
+    stack: &mut Vec<&'a str>,
+) -> Result<Option<Bounds>, AppError> {
+    if let Some(cached) = cache.get(cell_name) {
+        return Ok(*cached);
+    }
+
+    let raw_cell = raw_cells
+        .get(cell_name)
+        .ok_or_else(|| AppError::Parse(format!("missing raw GDS cell: {cell_name}")))?;
+
+    let mut bounds = raw_cell
+        .local_shapes
+        .iter()
+        .map(LayoutShape::bounds)
+        .reduce(|acc, shape_bounds| acc.union(shape_bounds));
+
+    for instance in &raw_cell.local_instances {
+        let target_name = instance.target_name.as_str();
+        if stack.contains(&target_name) {
+            return Err(AppError::Parse(format!(
+                "cyclic GDS hierarchy detected at {target_name}"
+            )));
+        }
+
+        stack.push(target_name);
+        let target_bounds = resolve_raw_cell_bounds(target_name, raw_cells, cache, stack)?;
+        stack.pop();
+
+        if let Some(instance_bounds) = raw_instance_bounds(instance, target_bounds) {
+            bounds = Some(match bounds {
+                Some(current) => current.union(instance_bounds),
+                None => instance_bounds,
+            });
+        }
+    }
+
+    cache.insert(cell_name, bounds);
+    Ok(bounds)
+}
+
+/// 把 GDS boundary 变成局部闭合图形。
+fn layout_shape_from_boundary(boundary: &Boundary) -> Option<LayoutShape> {
+    layout_shape_from_i32_points(
+        LayerId {
+            layer: boundary.layer as u32,
+            datatype: boundary.datatype as u32,
+        },
+        &boundary.xy,
+        true,
+        None,
+    )
+}
+
+/// 把 GDS box 变成局部闭合图形。
+fn layout_shape_from_gds_box(gds_box: &GDSBox) -> Option<LayoutShape> {
+    layout_shape_from_i32_points(
+        LayerId {
+            layer: gds_box.layer as u32,
+            datatype: gds_box.boxtype as u32,
+        },
+        &gds_box.xy,
+        true,
+        None,
+    )
+}
+
+/// 把 GDS path 变成局部折线。
+fn layout_shape_from_gds_path(path: &GPath) -> Option<LayoutShape> {
+    layout_shape_from_i32_points(
+        LayerId {
+            layer: path.layer as u32,
+            datatype: path.datatype as u32,
+        },
+        &path.xy,
+        false,
+        Some(path.width.unwrap_or_default().max(0) as f32),
+    )
+}
+
+/// 统一把 GDS 的局部整数点列转成 `LayoutShape`。
+fn layout_shape_from_i32_points(
+    layer: LayerId,
+    points: &[(i32, i32)],
+    closed: bool,
+    stroke_width: Option<f32>,
+) -> Option<LayoutShape> {
+    let points: Vec<Vec2> = points
+        .iter()
+        .map(|&(x, y)| Vec2::new(x as f32, y as f32))
+        .collect();
+
+    if points.is_empty() {
+        return None;
+    }
+
+    Some(LayoutShape::from_points(
+        layer,
+        points,
+        closed,
+        stroke_width,
+    ))
+}
+
+/// 把 `StructRef` 保留成一个局部实例引用。
+fn raw_instance_from_struct_ref(
+    sref: &StructRef,
+    cell_ids: &HashMap<&str, LayoutCellId>,
+) -> Result<RawGdsInstance, AppError> {
+    let target_cell_id = *cell_ids
+        .get(sref.sname.as_str())
+        .ok_or_else(|| AppError::Parse(format!("missing referenced cell: {}", sref.sname)))?;
+
+    Ok(RawGdsInstance {
+        target_cell_id,
+        target_name: sref.sname.clone(),
+        transform: layout_transform_from_gds_reference(
+            Vec2::new(sref.xy.0 as f32, sref.xy.1 as f32),
+            sref.strans.as_ref(),
+        ),
+        repetition: None,
+    })
+}
+
+/// 把 `ArrayRef` 保留成“一个实例 + 一个规则阵列语义”。
+fn raw_instance_from_array_ref(
+    aref: &ArrayRef,
+    cell_ids: &HashMap<&str, LayoutCellId>,
+) -> Result<RawGdsInstance, AppError> {
+    let target_cell_id = *cell_ids
+        .get(aref.sname.as_str())
+        .ok_or_else(|| AppError::Parse(format!("missing referenced cell: {}", aref.sname)))?;
+
+    let origin = aref
+        .xy
+        .first()
+        .map(|&(x, y)| Vec2::new(x as f32, y as f32))
+        .unwrap_or(Vec2::ZERO);
+    let cols = aref.columns.max(1) as u32;
+    let rows = aref.rows.max(1) as u32;
+    let column_step = array_ref_column_step(aref, origin, cols);
+    let row_step = array_ref_row_step(aref, origin, rows);
+
+    Ok(RawGdsInstance {
+        target_cell_id,
+        target_name: aref.sname.clone(),
+        transform: layout_transform_from_gds_reference(origin, aref.strans.as_ref()),
+        repetition: Some(LayoutRepetition::regular_grid(
+            cols,
+            rows,
+            column_step,
+            row_step,
+        )),
+    })
+}
+
+/// 把 raw instance 转成最终 `LayoutInstance`，并补齐实例 footprint。
+fn raw_instance_to_layout_instance(
+    instance: &RawGdsInstance,
+    target_bounds: Option<Bounds>,
+) -> LayoutInstance {
+    let local_bounds = raw_instance_bounds(instance, target_bounds).unwrap_or_else(|| {
+        let origin = instance.transform.translation;
+        Bounds::new(origin.x, origin.y, origin.x, origin.y)
+    });
+
+    let mut layout_instance = LayoutInstance::with_transform(
+        instance.target_cell_id,
+        local_bounds,
+        instance.transform,
+    );
+
+    if let Some(repetition) = instance.repetition.clone() {
+        layout_instance = layout_instance.with_repetition(repetition);
+    }
+
+    layout_instance
+}
+
+/// 计算一个 raw instance 在父 cell 局部坐标中的完整 footprint。
+fn raw_instance_bounds(instance: &RawGdsInstance, target_bounds: Option<Bounds>) -> Option<Bounds> {
+    let base_bounds = target_bounds.map(|bounds| transform_bounds(bounds, instance.transform));
+    match instance.repetition.as_ref() {
+        Some(LayoutRepetition::RegularGrid {
+            columns,
+            rows,
+            column_step,
+            row_step,
+        }) => {
+            let mut bounds: Option<Bounds> = None;
+            for row in 0..*rows as usize {
+                for col in 0..*columns as usize {
+                    let delta = *column_step * col as f32 + *row_step * row as f32;
+                    let repeated_bounds = match base_bounds {
+                        Some(base) => base.translate(delta),
+                        None => {
+                            let origin = instance.transform.translation + delta;
+                            Bounds::new(origin.x, origin.y, origin.x, origin.y)
+                        }
+                    };
+                    bounds = Some(match bounds {
+                        Some(current) => current.union(repeated_bounds),
+                        None => repeated_bounds,
+                    });
+                }
+            }
+            bounds
+        }
+        None => base_bounds.or_else(|| {
+            let origin = instance.transform.translation;
+            Some(Bounds::new(origin.x, origin.y, origin.x, origin.y))
+        }),
+    }
+}
+
+/// 把 GDS `STrans` 还原成学习友好的 `LayoutTransform`。
+fn layout_transform_from_gds_reference(origin: Vec2, strans: Option<&STrans>) -> LayoutTransform {
+    LayoutTransform {
+        translation: origin,
+        rotation_degrees: strans
+            .and_then(|transform| transform.angle)
+            .unwrap_or(0.0) as f32,
+        magnification: strans
+            .and_then(|transform| transform.magnification)
+            .unwrap_or(1.0) as f32,
+        mirrored_x: strans.map(|transform| transform.reflection).unwrap_or(false),
+    }
+}
+
+/// 计算 `ArrayRef` 的列步长。
+fn array_ref_column_step(aref: &ArrayRef, origin: Vec2, columns: u32) -> Vec2 {
+    if aref.xy.len() >= 2 && columns > 1 {
+        let array_col_vector = Vec2::new(aref.xy[1].0 as f32, aref.xy[1].1 as f32) - origin;
+        array_col_vector / columns as f32
+    } else {
+        Vec2::ZERO
+    }
+}
+
+/// 计算 `ArrayRef` 的行步长。
+fn array_ref_row_step(aref: &ArrayRef, origin: Vec2, rows: u32) -> Vec2 {
+    if aref.xy.len() >= 3 && rows > 1 {
+        let array_row_vector = Vec2::new(aref.xy[2].0 as f32, aref.xy[2].1 as f32) - origin;
+        array_row_vector / rows as f32
+    } else {
+        Vec2::ZERO
+    }
+}
+
+/// 把一个局部 bounds 经过实例变换后，变成父坐标系下的 bounds。
+fn transform_bounds(bounds: Bounds, transform: LayoutTransform) -> Bounds {
+    let affine = Transform2D::from_gds_reference(
+        transform.translation,
+        Some(&STrans {
+            reflection: transform.mirrored_x,
+            absolute_magnification: false,
+            absolute_angle: false,
+            magnification: Some(transform.magnification as f64),
+            angle: Some(transform.rotation_degrees as f64),
+        }),
+    );
+    let corners = [
+        Vec2::new(bounds.min_x, bounds.min_y),
+        Vec2::new(bounds.max_x, bounds.min_y),
+        Vec2::new(bounds.max_x, bounds.max_y),
+        Vec2::new(bounds.min_x, bounds.max_y),
+    ];
+    let mut transformed = corners.into_iter().map(|corner| affine.apply_point(corner));
+    let first = transformed.next().expect("bounds corners");
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x;
+    let mut max_y = first.y;
+    for point in transformed {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    Bounds::new(min_x, min_y, max_x, max_y)
 }
 
 /// 收集一个 GDS structure 中的几何，并递归展开层级引用。

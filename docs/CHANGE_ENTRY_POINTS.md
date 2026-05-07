@@ -183,11 +183,11 @@ renderer 应该尽量接收已经语义清晰的 scene，
 
 ### hierarchy level range 属于这类需求的一个典型例子
 
-这次实现就是沿着这条路径走的：
-1. 在 `scene::RectShape` 上增加 `hierarchy_level`
-2. 在 `io/laykit_loader.rs` 的递归展开里传深度
-3. 在 `app/mod.rs` 里保留 `full_scene`
-4. 再由 `app` 生成按 `min/max level` 过滤后的运行 `scene`
+现在这条链已经升级成：
+1. `layout/mod.rs` 保留分层 source
+2. `io/laykit_loader.rs` 把 `GDSStructure -> LayoutCell`
+3. `layout/view_builder.rs` 按 `min/max level` 构建临时 workset `Scene`
+4. `app/mod.rs` 只保留当前 source 和当前 workset，不再常驻 `full_scene`
 5. `ui/mod.rs` 只负责暴露 level range slider
 6. `persistence/mod.rs` 再决定这些范围如何保存/恢复
 

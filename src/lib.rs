@@ -21,6 +21,7 @@ pub mod camera;
 pub mod config;
 pub mod error;
 pub mod io;
+pub mod layout;
 pub mod perf;
 pub mod persistence;
 pub mod renderer;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use flayout_wgpu::{
     persistence::{
@@ -89,11 +89,11 @@ fn resolve_saved_view_index_matches_saved_name() {
     let bundle = SceneBundle::new(vec![
         SceneView {
             name: "leaf".to_string(),
-            scene: Scene::empty(),
+            scene: Arc::new(Scene::empty()),
         },
         SceneView {
             name: "top".to_string(),
-            scene: Scene::empty(),
+            scene: Arc::new(Scene::empty()),
         },
     ]);
 
@@ -166,6 +166,38 @@ fn layer_bypass_thresholds_round_trip_through_viewer_config() {
     save_viewer_config_to_path(&temp_path, &config).expect("save config");
     let loaded = load_viewer_config_from_path(&temp_path).expect("load config");
 
+    assert_eq!(loaded.layer_bypass_entry_threshold, 8);
+    assert_eq!(loaded.layer_bypass_work_threshold, 128);
+
+    let _ = std::fs::remove_file(temp_path);
+}
+
+#[test]
+fn old_config_without_hierarchy_range_fields_still_loads() {
+    let temp_path = std::env::temp_dir().join(format!(
+        "flayout-viewer-config-{}-old-layout.json",
+        std::process::id()
+    ));
+    let json = r#"{
+  "layout_path": "/tmp/example.gds",
+  "selected_view_name": "top",
+  "camera": { "pan_x": 0.0, "pan_y": 0.0, "zoom": 1.0 },
+  "hidden_layers": [],
+  "layer_draw_modes": [],
+  "layer_hatch_styles": [],
+  "draw_mode": "hatch_outline",
+  "hatch_spacing": 12.0,
+  "hatch_width": 2.0,
+  "tile_grid_divisions": 9,
+  "tile_cache_capacity": 256,
+  "progressive_bypass_threshold": 24
+}"#;
+
+    std::fs::write(&temp_path, json).expect("write old config");
+    let loaded = load_viewer_config_from_path(&temp_path).expect("load old config");
+
+    assert_eq!(loaded.min_hierarchy_level, None);
+    assert_eq!(loaded.max_hierarchy_level, None);
     assert_eq!(loaded.layer_bypass_entry_threshold, 8);
     assert_eq!(loaded.layer_bypass_work_threshold, 128);
 

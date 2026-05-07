@@ -12,6 +12,7 @@ mod laykit_loader;
 use std::path::Path;
 
 use crate::error::AppError;
+use crate::layout::LayoutBundle;
 use crate::scene::{Scene, SceneBundle};
 
 /// 按路径加载版图，并返回可供 UI 切换的 `SceneBundle`。
@@ -36,6 +37,37 @@ pub fn load_layout_bundle(path: &str) -> Result<SceneBundle, AppError> {
     match ext.as_deref() {
         Some("gds") => laykit_loader::load_gds(path_ref),
         Some("oas") => laykit_loader::load_oasis(path_ref),
+        _ => Err(AppError::UnsupportedFormat(path.to_string())),
+    }
+}
+
+/// 按路径加载“分层 GDS bundle”。
+///
+/// 这是 Task 2 期间保留的一个临时桥接入口：
+/// - 旧 viewer 仍然继续消费扁平 `SceneBundle`
+/// - 新的层次化内存架构先从 GDS loader 这端开始落地
+///
+/// 后续 Task 3 / 4 会把 app 和 renderer 逐步接到这个分层模型上。
+pub fn load_layout_hierarchy_bundle(path: &str) -> Result<LayoutBundle, AppError> {
+    if path.trim().is_empty() {
+        return Err(AppError::MissingPath);
+    }
+
+    let path_ref = Path::new(path);
+    if !path_ref.exists() {
+        return Err(AppError::MissingFile(path.to_string()));
+    }
+
+    let ext = path_ref
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("gds") => laykit_loader::load_gds_layout_bundle(path_ref),
+        Some("oas") => Err(AppError::UnsupportedFormat(format!(
+            "hierarchical OASIS loading is not implemented yet: {path}"
+        ))),
         _ => Err(AppError::UnsupportedFormat(path.to_string())),
     }
 }

@@ -14,20 +14,22 @@
 4. `src/ui/mod.rs`
 5. `src/camera/mod.rs`
 6. `src/scene/mod.rs`
-7. `src/persistence/mod.rs`
-8. `src/io/mod.rs`
-9. `src/io/laykit_loader.rs`
-10. `src/renderer/mod.rs`
-11. `src/renderer/geometry.rs`
-12. `src/renderer/pipeline.rs`
-13. `src/renderer/scene.wgsl`
-14. `tests/` 目录
-15. `docs/LAYOUT_IMPORT_GUIDE.md`
-16. `docs/RENDER_FRAME_GUIDE.md`
-17. `docs/PERF_CACHE_GUIDE.md`
-18. `docs/SHAPE_TO_PIXEL_GUIDE.md`
-19. `docs/SOURCE_INDEX.md`
-20. `docs/TEST_WALKTHROUGH.md`
+7. `src/layout/mod.rs`
+8. `src/layout/view_builder.rs`
+9. `src/persistence/mod.rs`
+10. `src/io/mod.rs`
+11. `src/io/laykit_loader.rs`
+12. `src/renderer/mod.rs`
+13. `src/renderer/geometry.rs`
+14. `src/renderer/pipeline.rs`
+15. `src/renderer/scene.wgsl`
+16. `tests/` 目录
+17. `docs/LAYOUT_IMPORT_GUIDE.md`
+18. `docs/RENDER_FRAME_GUIDE.md`
+19. `docs/PERF_CACHE_GUIDE.md`
+20. `docs/SHAPE_TO_PIXEL_GUIDE.md`
+21. `docs/SOURCE_INDEX.md`
+22. `docs/TEST_WALKTHROUGH.md`
 
 ## 为什么这样看
 
@@ -55,20 +57,35 @@
 
 这里能帮你理解“交互为什么跟手”和“fit to window 为什么能工作”。
 
-### 3. 再看 scene 层
+### 3. 再看 scene 层和新的 layout 层
 
-读 `src/scene/mod.rs` 时，不要把它当成“普通数据结构文件”。
+现在有两层数据结构要分开理解：
+
+- `scene/mod.rs`：renderer 真正消费的扁平 workset
+- `layout/mod.rs`：GDS 的分层 source
+
+先读 `src/scene/mod.rs`，再读 `src/layout/mod.rs` 和 `src/layout/view_builder.rs`。
 
 重点看：
 - 为什么需要 `Scene`
 - 为什么需要 `SceneBundle`
+- 为什么现在还需要额外一层 `LayoutBundle`
 - `RectShape` 现在其实已经承担了哪些图元职责
 - `hierarchy_level` 为什么直接挂在 shape 上
 - `Bounds` 为什么会被这么多地方复用
 
-这是整个项目的数据中台。
+这一组文件一起构成当前项目的数据中台。
 
-### 4. 先看 persistence 层
+### 4. 再看 view builder 和 persistence 层
+
+`src/layout/view_builder.rs` 是这轮内存重构里最值得跟的一层。
+
+重点看：
+- 为什么输入是 `LayoutBundle + root + level range + visible bounds`
+- 为什么输出仍然是 renderer 熟悉的 `Scene`
+- 为什么这一步能显著减少常驻内存
+
+接着再读 `src/persistence/mod.rs`。
 
 读 `src/persistence/mod.rs` 时，重点看：
 - 为什么要把持久化结构和 runtime 结构分开
@@ -110,18 +127,24 @@
 
 可以把整个 viewer 理解成这条主链：
 
-`layout file -> laykit -> SceneBundle -> Scene -> visible query -> tile cache -> GPU draw -> egui overlay`
+`layout file -> laykit -> LayoutBundle/SceneBundle -> view builder or flat scene -> visible query -> tile cache -> GPU draw -> egui overlay`
 
 更细一点：
 
 1. `app` 从默认路径读取版图文件
-2. `io/laykit_loader` 把 GDS / OASIS 转成内部 `SceneBundle`
-3. `app` 选择一个当前 `Scene`
-4. `camera` 决定当前可见世界范围
-5. `renderer/geometry` 先通过空间索引找 visible shapes / visible tiles
-6. `renderer` 用 tile cache 复用已有 GPU buffer
-7. `scene.wgsl` 再把平移和 viewport 变换补齐
-8. `egui` 最后把左侧 UI 叠加到画面上
+2. `io/laykit_loader`
+   - `GDS` 转成 `LayoutBundle`
+   - `OASIS` 目前仍然转成扁平 `SceneBundle`
+3. `app`
+   - 选择当前 root/view
+   - 决定当前 `min/max level`
+4. `layout/view_builder`
+   - 只在 `GDS` 路径上，把当前 root 的必要子树展开成临时 `Scene`
+5. `camera` 决定当前可见世界范围
+6. `renderer/geometry` 先通过空间索引找 visible shapes / visible tiles
+7. `renderer` 用 tile cache 复用已有 GPU buffer
+8. `scene.wgsl` 再把平移和 viewport 变换补齐
+9. `egui` 最后把左侧 UI 叠加到画面上
 
 ## 你最值得重点理解的 5 个点
 
@@ -169,17 +192,31 @@
 
 这种结构对学习和后续扩展都更友好。
 
-### 6. 为什么 hierarchy level range 放在 app 层，而不是 renderer 层
+### 6. 为什么 hierarchy level range 现在放在 app / view builder 层，而不是 renderer 层
 
-现在的实现是：
-- `full_scene` 保留当前 root cell 的完整展开结果
-- `app` 根据 `min/max level` 生成过滤后的 `scene`
-- renderer 只消费这个过滤后的 `scene`
+现在新的 `GDS` 路径是：
+- `LayoutBundle` 保留分层 source
+- `app` 保留当前 root / level range
+- `view_builder` 只展开当前要求的层级
+- renderer 只消费这个 workset `Scene`
 
 这样做的好处是：
 - renderer 不需要知道“层级范围”这个业务概念
 - 现有索引、tile cache、统计链可以直接复用
-- UI 仍然可以拿到完整 scene 的 `max level`
+- 更深层的数据如果当前不需要，就不会整份常驻内存
+
+### 7. 为什么现在值得先读 `memory_probe`
+
+如果你在学这轮“从根上减内存”的重构，我会建议你顺手看：
+
+- `examples/memory_probe.rs`
+
+它现在能直接展示：
+- 当前是 `flat-legacy` 还是 `hierarchical-gds`
+- 当前请求的 `min/max level`
+- workset 展开后的 `shape_count / total_points`
+
+这个 probe 很适合帮你把“结构变化”变成直观数字。 
 
 ## 如果你想带着问题去读
 

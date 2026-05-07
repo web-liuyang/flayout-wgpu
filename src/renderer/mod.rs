@@ -16,7 +16,7 @@ pub mod pipeline;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    hash::{Hash, Hasher},
+    hash::Hash,
     sync::Arc,
 };
 
@@ -225,32 +225,17 @@ struct PendingTileBuild {
     tile_key: TileCacheKey,
 }
 
-/// 一个 tile 对应的一段 GPU 顶点缓冲。
+/// 一个 `tile + layer` 对应的一段 GPU 顶点缓冲。
 ///
-/// 这里除了 GPU buffer 本身，还刻意保留了 CPU 顶点副本：
-/// - 显示阶段可以再按 tile 重新合批
-/// - 不必每次都反向从 GPU 取数据
+/// 这里现在只保留真正用于绘制的 GPU buffer。
+/// 之前为了做 per-tile display batch，我们还额外持有了一份 CPU 顶点副本，
+/// 以及第二层合批后的 GPU buffer；那样会显著放大内存占用，
+/// 但对实际卡顿改善并不明显。
 struct TileCacheEntry {
-    cpu_vertices: Arc<[LineVertex]>,
-    vertex_count: u32,
-    byte_size: usize,
-    last_used_tick: u64,
-}
-
-/// 一个 tile 当前可见 layer 组合对应的显示 batch。
-///
-/// 底层几何缓存仍然保持 `tile + layer` 粒度，
-/// 这里只是在显示阶段把同一 tile 下当前需要画的 layer 顶点拼成一个临时批次，
-/// 以减少单帧 draw call。
-///
-/// 可以把它理解成“第二级显示缓存”：
-/// - 第一级：`tile + layer` 几何缓存
-/// - 第二级：当前这一帧真正要画的 per-tile 合批结果
-struct TileDisplayBatchEntry {
-    signature: u64,
     vertex_buffer: wgpu::Buffer,
     vertex_count: u32,
     byte_size: usize,
+    last_used_tick: u64,
 }
 
 /// 默认 tile cache 条目上限。
@@ -299,7 +284,7 @@ pub struct Renderer {
     size: PhysicalSize<u32>,
     egui_renderer: EguiRenderer,
     scene_pipeline: ScenePipeline,
-    scene: Scene,
+    scene: Arc<Scene>,
     spatial_index: ShapeSpatialIndex,
     tile_grid: TileGridIndex,
     prepared_tile_fragments: PreparedTileFragments,
@@ -316,9 +301,7 @@ pub struct Renderer {
     cached_scene_key: Option<RenderCacheKey>,
     tile_cache_domain: Option<TileCacheDomainKey>,
     tile_vertex_cache: HashMap<TileCacheKey, TileCacheEntry>,
-    tile_display_batch_cache: HashMap<TileId, TileDisplayBatchEntry>,
     visible_tile_keys: Vec<TileCacheKey>,
-    visible_tiles_to_draw: Vec<TileId>,
     requested_tile_keys: Vec<TileCacheKey>,
     pending_tile_builds: VecDeque<PendingTileBuild>,
     /// 当前处在“构建渐进流程”中的活动 layer。
@@ -411,7 +394,7 @@ impl Renderer {
 
         let egui_renderer = EguiRenderer::new(&device, format, RendererOptions::default());
         let scene_pipeline = ScenePipeline::new(&device, format);
-        let empty_scene = Scene::empty();
+        let empty_scene = Arc::new(Scene::empty());
 
         Ok(Self {
             surface,
@@ -421,7 +404,7 @@ impl Renderer {
             size,
             egui_renderer,
             scene_pipeline,
-            scene: empty_scene.clone(),
+            scene: Arc::clone(&empty_scene),
             spatial_index: ShapeSpatialIndex::build(&empty_scene),
             tile_grid: TileGridIndex::build_with_divisions(
                 &empty_scene,
@@ -444,9 +427,7 @@ impl Renderer {
             cached_scene_key: None,
             tile_cache_domain: None,
             tile_vertex_cache: HashMap::new(),
-            tile_display_batch_cache: HashMap::new(),
             visible_tile_keys: Vec::new(),
-            visible_tiles_to_draw: Vec::new(),
             requested_tile_keys: Vec::new(),
             pending_tile_builds: VecDeque::new(),
             active_progressive_layer: None,
@@ -632,7 +613,6 @@ impl Renderer {
         self.cached_scene_key = None;
         self.requested_tile_keys.clear();
         self.visible_tile_keys.clear();
-        self.visible_tiles_to_draw.clear();
         self.pending_tile_builds.clear();
         self.debug_stats.cache_hit = false;
     }
@@ -648,7 +628,6 @@ impl Renderer {
         self.cached_scene_key = None;
         self.requested_tile_keys.clear();
         self.visible_tile_keys.clear();
-        self.visible_tiles_to_draw.clear();
         self.pending_tile_builds.clear();
         self.active_progressive_layer = None;
         self.debug_stats.cache_hit = false;
@@ -669,7 +648,6 @@ impl Renderer {
         self.cached_scene_key = None;
         self.requested_tile_keys.clear();
         self.visible_tile_keys.clear();
-        self.visible_tiles_to_draw.clear();
         self.pending_tile_builds.clear();
         self.active_progressive_layer = None;
         self.debug_stats.cache_hit = false;
@@ -689,8 +667,8 @@ impl Renderer {
     }
 
     /// 用新场景替换旧场景，并重建相关索引。
-    pub fn update_scene(&mut self, scene: &Scene) {
-        self.scene = scene.clone();
+    pub fn update_scene(&mut self, scene: Arc<Scene>) {
+        self.scene = scene;
         self.spatial_index = ShapeSpatialIndex::build(&self.scene);
         self.tile_grid = TileGridIndex::build_with_divisions(&self.scene, self.tile_grid_divisions);
         self.rebuild_prepared_tile_fragments();
@@ -780,7 +758,7 @@ impl Renderer {
         // - 用 shader 里的位置缩放让画面跟手
         let freeze_interaction_view = should_freeze_interaction_view(
             interaction_degraded,
-            self.cached_scene_key.is_some() && !self.visible_tiles_to_draw.is_empty(),
+            self.cached_scene_key.is_some() && !self.visible_tile_keys.is_empty(),
         );
         if !freeze_interaction_view {
             self.update_scene_cache(
@@ -863,9 +841,9 @@ impl Renderer {
             render_pass.set_pipeline(self.scene_pipeline.render_pipeline());
             render_pass.set_bind_group(0, &scene_bind_group, &[]);
             let translation = camera.pan() + canvas_origin;
-            for tile_id in &self.visible_tiles_to_draw {
-                if let Some(entry) = self.tile_display_batch_cache.get(tile_id) {
-                    let tile_bounds = self.tile_grid.tile_bounds(*tile_id);
+            for tile_key in &self.visible_tile_keys {
+                if let Some(entry) = self.tile_vertex_cache.get(tile_key) {
+                    let tile_bounds = self.tile_grid.tile_bounds(tile_key.tile_id);
                     if let Some(tile_scissor) = tile_scissor_rect(
                         tile_bounds,
                         camera.zoom(),
@@ -963,7 +941,6 @@ fn update_scene_cache(
     };
     if self.tile_cache_domain != Some(domain) {
         self.tile_vertex_cache.clear();
-        self.tile_display_batch_cache.clear();
         self.tile_cache_domain = Some(domain);
     }
 
@@ -1189,51 +1166,20 @@ fn update_scene_cache(
     );
     self.total_cache_evictions += evicted;
 
-    let mut visible_tile_groups: BTreeMap<TileId, Vec<TileCacheKey>> = BTreeMap::new();
-    for tile_key in visible_tile_keys.iter().copied() {
-        visible_tile_groups.entry(tile_key.tile_id).or_default().push(tile_key);
-    }
-
-    let mut visible_tiles_to_draw = Vec::new();
-    let visible_tile_ids: HashSet<_> = visible_tile_groups.keys().copied().collect();
-    self.tile_display_batch_cache
-        .retain(|tile_id, _| visible_tile_ids.contains(tile_id));
-
-    for (tile_id, tile_keys) in &visible_tile_groups {
-        let signature = build_tile_display_batch_signature(tile_keys);
-        let needs_rebuild = self
-            .tile_display_batch_cache
-            .get(tile_id)
-            .map(|entry| entry.signature != signature)
-            .unwrap_or(true);
-        if needs_rebuild {
-            if let Some(entry) = create_tile_display_batch_entry(
-                &self.device,
-                tile_keys,
-                &self.tile_vertex_cache,
-            ) {
-                self.tile_display_batch_cache.insert(*tile_id, entry);
-            } else {
-                self.tile_display_batch_cache.remove(tile_id);
-            }
-        }
-        if self.tile_display_batch_cache.contains_key(tile_id) {
-            visible_tiles_to_draw.push(*tile_id);
-        }
-    }
-
-    let cache_bytes: usize = self.tile_vertex_cache.values().map(|entry| entry.byte_size).sum::<usize>()
-        + self.tile_display_batch_cache.values().map(|entry| entry.byte_size).sum::<usize>();
+    let cache_bytes: usize = self
+        .tile_vertex_cache
+        .values()
+        .map(|entry| entry.byte_size)
+        .sum::<usize>();
 
     self.visible_tile_keys = visible_tile_keys;
-    self.visible_tiles_to_draw = visible_tiles_to_draw;
     self.debug_stats = RenderDebugStats::new(
         self.scene.shapes().len(),
         self.shape_query_stats.candidate_shapes,
         self.shape_query_stats.visible_shapes,
         self.shape_query_stats.bucket_hits,
         total_vertices,
-        self.visible_tiles_to_draw.len(),
+        self.visible_tile_keys.len(),
         self.shape_query_stats.visible_tiles,
         tile_cache_hits,
         tile_cache_misses,
@@ -1282,7 +1228,6 @@ fn invalidate_progressive_state(&mut self, clear_gpu_cache: bool) {
     if clear_gpu_cache {
         self.tile_cache_domain = None;
         self.tile_vertex_cache.clear();
-        self.tile_display_batch_cache.clear();
     }
 }
 
@@ -1493,9 +1438,12 @@ fn create_tile_cache_entry(
     vertices: &[LineVertex],
     last_used_tick: u64,
 ) -> Option<TileCacheEntry> {
-    let _ = device;
     (!vertices.is_empty()).then(|| TileCacheEntry {
-        cpu_vertices: Arc::from(vertices.to_vec().into_boxed_slice()),
+        vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tile-layer-vertex-buffer"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
         vertex_count: vertices.len() as u32,
         byte_size: std::mem::size_of_val(vertices),
         last_used_tick,
@@ -1504,39 +1452,6 @@ fn create_tile_cache_entry(
 
 fn should_freeze_interaction_view(interaction_degraded: bool, has_stable_view: bool) -> bool {
     interaction_degraded && has_stable_view
-}
-
-fn build_tile_display_batch_signature(tile_keys: &[TileCacheKey]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    tile_keys.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn create_tile_display_batch_entry(
-    device: &wgpu::Device,
-    tile_keys: &[TileCacheKey],
-    tile_vertex_cache: &HashMap<TileCacheKey, TileCacheEntry>,
-) -> Option<TileDisplayBatchEntry> {
-    let mut vertices = Vec::new();
-    for tile_key in tile_keys {
-        if let Some(entry) = tile_vertex_cache.get(tile_key) {
-            vertices.extend_from_slice(&entry.cpu_vertices);
-        }
-    }
-    if vertices.is_empty() {
-        return None;
-    }
-
-    Some(TileDisplayBatchEntry {
-        signature: build_tile_display_batch_signature(tile_keys),
-        vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tile-display-batch-buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        }),
-        vertex_count: vertices.len() as u32,
-        byte_size: std::mem::size_of_val(vertices.as_slice()),
-    })
 }
 
 

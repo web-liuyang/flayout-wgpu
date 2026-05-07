@@ -9,7 +9,7 @@
 //! 因为版图解析库的原始数据结构往往会带很多格式细节，
 //! 如果渲染层直接依赖它们，后面很容易牵一发动全身。
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use glam::Vec2;
 
@@ -109,7 +109,9 @@ pub struct Scene {
 #[derive(Debug, Clone)]
 pub struct SceneView {
     pub name: String,
-    pub scene: Scene,
+    /// 这里用 `Arc<Scene>`，避免 bundle / app / renderer 之间为同一个 root cell
+    /// 重复拷贝整份几何数据。
+    pub scene: Arc<Scene>,
 }
 
 /// 一个版图文件展开后的“可选场景集合”。
@@ -122,6 +124,32 @@ pub struct SceneBundle {
 }
 
 impl RectShape {
+    /// 用一组点直接构造内部图元。
+    ///
+    /// 这个构造函数主要给层次化 `view_builder` 用：
+    /// - loader 端先保留 cell 本地点列
+    /// - 真正进入临时扁平 `Scene` 时，再在这里补齐 bounds 和层级深度
+    pub fn from_points(
+        layer: LayerId,
+        points: Vec<Vec2>,
+        closed: bool,
+        hierarchy_level: u32,
+        stroke_width_world: Option<f32>,
+    ) -> Self {
+        let mut bounds = bounds_from_points(&points).unwrap_or(Bounds::new(0.0, 0.0, 0.0, 0.0));
+        if let Some(width) = stroke_width_world {
+            bounds = bounds.pad(width * 0.5);
+        }
+        Self {
+            layer,
+            hierarchy_level,
+            bounds,
+            points,
+            closed,
+            stroke_width_world,
+        }
+    }
+
     /// 构造一个矩形轮廓。
     ///
     /// 这里直接按四个角点生成顺时针点列，
@@ -144,15 +172,7 @@ impl RectShape {
 
     /// 构造一条折线。
     pub fn polyline(layer: LayerId, points: Vec<Vec2>, stroke_width_world: f32) -> Self {
-        let bounds = bounds_from_points(&points).unwrap_or(Bounds::new(0.0, 0.0, 0.0, 0.0));
-        Self {
-            layer,
-            hierarchy_level: 0,
-            bounds,
-            points,
-            closed: false,
-            stroke_width_world: Some(stroke_width_world),
-        }
+        Self::from_points(layer, points, false, 0, Some(stroke_width_world))
     }
 }
 
@@ -253,7 +273,7 @@ impl SceneBundle {
     pub fn single(name: impl Into<String>, scene: Scene) -> Self {
         Self::new(vec![SceneView {
             name: name.into(),
-            scene,
+            scene: Arc::new(scene),
         }])
     }
 
@@ -274,7 +294,29 @@ impl SceneBundle {
 
     /// 当前选中的场景。
     pub fn current_scene(&self) -> Option<&Scene> {
-        self.current_view().map(|view| &view.scene)
+        self.current_view().map(|view| view.scene.as_ref())
+    }
+
+    /// 当前选中场景的共享句柄。
+    ///
+    /// app 层需要拿到这个句柄再往 renderer 传递，
+    /// 这样可以避免 bundle -> app -> renderer 之间继续复制完整场景。
+    pub fn current_scene_handle(&self) -> Option<Arc<Scene>> {
+        self.current_view().map(|view| Arc::clone(&view.scene))
+    }
+
+    /// 只保留当前选中 view 的真实 scene，其余 view 退化成空 scene 占位。
+    ///
+    /// 这样做的目的是在大版图下尽快释放未选中 root cell 的展开结果，
+    /// 避免 `SceneBundle` 为了保留 cell 列表而常驻整份扁平几何。
+    pub fn retain_only_selected_scene(&mut self, selected_scene: Arc<Scene>) {
+        for (index, view) in self.views.iter_mut().enumerate() {
+            if index == self.selected {
+                view.scene = Arc::clone(&selected_scene);
+            } else {
+                view.scene = Arc::new(Scene::empty());
+            }
+        }
     }
 
     /// 切换视图。

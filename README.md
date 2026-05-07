@@ -42,7 +42,7 @@
 
 - 读取 `GDS` / `OASIS`
 - 自动找出 root cells，并通过 UI 选择当前 cell
-- 递归展开层级引用
+- `GDS` 已切到分层内存模型，不再默认把整棵 hierarchy 先扁平展开
 - 按实例层级深度过滤显示范围（`Min level / Max level`）
 - 显示基础轮廓/路径
 - 鼠标拖拽平移
@@ -171,25 +171,39 @@ cargo run
 
 这样以后即使换解析库，也不会让整个项目都被牵着改。
 
-### 2. 先扁平化层级，再渲染
+### 2. `GDS` 先保留层次化模型，再按需构建 workset
 
-当前导入层会把 root cell 展开成一个可直接渲染的场景。
-这不是终极方案，但对学习和验证正确性非常有帮助。
+当前 `GDS` 路径已经不再走“加载时先把整棵 hierarchy 完全扁平展开”的模式。
+现在更接近：
+
+- `laykit_loader` 先构造 `LayoutBundle`
+- `app` 持有当前 root cell 和当前 level range
+- `view_builder` 再按需生成当前 workset `Scene`
+
+这一步非常关键，因为它让常驻内存更多地跟：
+- 当前 root cell
+- 当前 level range
+- 当前视图工作集
+
+绑定，而不是和整棵深层 hierarchy 绑定。
 
 ### 3. UI 不直接改 renderer
 
 `ui` 只产生 `UiAction`，`app` 再统一调度状态变化。
 这样状态流更清楚，也更容易扩功能。
 
-### 3.5. hierarchy level 过滤放在 app 层，而不是 renderer 层
+### 3.5. hierarchy level 过滤放在 app / workset builder 层，而不是 renderer 层
 
-当前 root cell 的完整展开结果会先存在 `full_scene`。
-真正送进 renderer 的 `scene`，则是 `full_scene` 按 `min/max level` 过滤后的结果。
+现在的实现是：
+- `GDS`：`LayoutBundle` 保留分层 source
+- `app`：记录当前 `min/max level`
+- `view_builder`：按这个范围构建当前 workset `Scene`
+- renderer：只消费已经裁好的 workset
 
 这样做的好处是：
 - renderer 不需要知道“层级范围”这个业务概念
 - 现有索引、tile cache、统计链都可以直接复用
-- UI 也能始终拿到完整 scene 的 `max level`
+- UI 仍然可以拿到当前 root cell 的真实 `max level`
 
 ### 4. 平移和缩放的职责拆开
 
@@ -215,6 +229,31 @@ cargo run
 4. tile cache 复用 GPU buffer
 
 这个顺序更适合学习，也更利于持续验证。
+
+### 6. 当前内存架构和 probe
+
+如果你现在重点在学“大版图为什么容易爆内存”，最值得看的新链路是：
+
+- `src/layout/mod.rs`
+- `src/layout/view_builder.rs`
+- `src/io/laykit_loader.rs`
+- `examples/memory_probe.rs`
+
+当前 `memory_probe` 已经能区分：
+- `flat-legacy`
+- `hierarchical-gds`
+
+例如对 `example_mzi_perf.gds / MziArray`，在只展开 `0..2` 层时，当前 probe 实测：
+- `shape_count = 230016`
+- `total_points = 1150080`
+
+而旧的全量扁平路径曾经探测到：
+- `shape_count = 2274428`
+- `total_points = 55362608`
+
+这条对比能很直观地说明：
+- 这轮重构真正减少的不是一点点 cache
+- 而是“整棵 hierarchy 默认常驻”的数据本体
 
 ---
 
