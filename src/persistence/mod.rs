@@ -259,7 +259,9 @@ pub fn filter_layer_draw_modes_for_scene(
         .iter()
         .filter_map(|entry| {
             let layer = entry.layer.to_runtime();
-            existing.contains(&layer).then_some((layer, entry.mode.to_runtime()))
+            existing
+                .contains(&layer)
+                .then_some((layer, entry.mode.to_runtime()))
         })
         .collect()
 }

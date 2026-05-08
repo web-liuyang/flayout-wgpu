@@ -9,13 +9,11 @@
 //! - scene 是否能正确暴露 layer 与 shape 元信息
 
 use flayout_wgpu::{
-    app::{
-        LoadState, fill_missing_layer_hatch_styles, recommended_initial_hierarchy_level_range,
-    },
+    app::{LoadState, fill_missing_layer_hatch_styles, recommended_initial_hierarchy_level_range},
     camera::Camera2D,
     config::DEFAULT_LAYOUT_PATH,
     io::{load_layout_hierarchy_bundle, load_layout_scene},
-    layout::LayoutRepetition,
+    layout::{LayoutRepetition, LayoutViewBuildOptions, build_layout_view_scene},
     renderer::geometry::{HatchStylePreset, project_points},
     scene::{Bounds, LayerId, RectShape, Scene},
 };
@@ -152,12 +150,18 @@ fn path_shape_can_preserve_world_stroke_width() {
 #[test]
 fn scene_can_filter_shapes_by_hierarchy_level_range() {
     let mut root = RectShape::rectangle(
-        LayerId { layer: 1, datatype: 0 },
+        LayerId {
+            layer: 1,
+            datatype: 0,
+        },
         Bounds::new(0.0, 0.0, 10.0, 10.0),
     );
     root.hierarchy_level = 0;
     let mut child = RectShape::rectangle(
-        LayerId { layer: 2, datatype: 0 },
+        LayerId {
+            layer: 2,
+            datatype: 0,
+        },
         Bounds::new(20.0, 20.0, 30.0, 30.0),
     );
     child.hierarchy_level = 2;
@@ -165,7 +169,13 @@ fn scene_can_filter_shapes_by_hierarchy_level_range() {
 
     let filtered = scene.filtered_by_hierarchy_range(0, 1);
     assert_eq!(filtered.stats().shape_count, 1);
-    assert_eq!(filtered.shapes()[0].layer, LayerId { layer: 1, datatype: 0 });
+    assert_eq!(
+        filtered.shapes()[0].layer,
+        LayerId {
+            layer: 1,
+            datatype: 0
+        }
+    );
     assert_eq!(scene.max_hierarchy_level(), 2);
 }
 
@@ -174,7 +184,10 @@ fn large_scene_defaults_to_half_hierarchy_depth() {
     let mut shapes = Vec::new();
     for index in 0..60_000usize {
         let mut shape = RectShape::rectangle(
-            LayerId { layer: 1, datatype: 0 },
+            LayerId {
+                layer: 1,
+                datatype: 0,
+            },
             Bounds::new(index as f32, 0.0, index as f32 + 1.0, 1.0),
         );
         shape.hierarchy_level = if index % 3 == 0 { 5 } else { 0 };
@@ -284,7 +297,11 @@ fn gds_loader_builds_hierarchical_layout() {
     assert_eq!(leaf.local_shapes()[1].stroke_width(), Some(6.0));
     assert_eq!(
         leaf.local_shapes()[1].points(),
-        &[Vec2::new(5.0, 5.0), Vec2::new(35.0, 5.0), Vec2::new(35.0, 15.0)]
+        &[
+            Vec2::new(5.0, 5.0),
+            Vec2::new(35.0, 5.0),
+            Vec2::new(35.0, 15.0)
+        ]
     );
 
     let top = bundle
@@ -295,7 +312,10 @@ fn gds_loader_builds_hierarchical_layout() {
     assert_eq!(top.local_shapes().len(), 0);
     assert_eq!(top.local_instance_count(), 1);
     let top_instance = &top.instances()[0];
-    assert_eq!(top_instance.transform().translation, Vec2::new(100.0, 200.0));
+    assert_eq!(
+        top_instance.transform().translation,
+        Vec2::new(100.0, 200.0)
+    );
     assert_eq!(top_instance.transform().rotation_degrees, 0.0);
     assert_eq!(top_instance.transform().magnification, 1.0);
     assert!(!top_instance.transform().mirrored_x);
@@ -309,7 +329,10 @@ fn gds_loader_builds_hierarchical_layout() {
     assert_eq!(grid.local_shapes().len(), 1);
     assert_eq!(grid.local_instance_count(), 1);
     let array_instance = &grid.instances()[0];
-    assert_eq!(array_instance.transform().translation, Vec2::new(20.0, 30.0));
+    assert_eq!(
+        array_instance.transform().translation,
+        Vec2::new(20.0, 30.0)
+    );
     assert_eq!(
         array_instance.repetition(),
         Some(&LayoutRepetition::regular_grid(
@@ -429,4 +452,104 @@ fn write_temp_gds_file(file: GDSIIFile, prefix: &str) -> PathBuf {
     ));
     file.write_to_file(&path).expect("write temp gds");
     path
+}
+
+#[test]
+fn vias_45_hierarchical_builder_matches_flat_scene_signature_for_visible_levels() {
+    let flat_bundle =
+        flayout_wgpu::io::load_layout_bundle("/Users/liuyang/Desktop/xiaoyao/gdsii/vias_45.gds")
+            .expect("load flat vias_45 bundle");
+    let flat_scene = flat_bundle
+        .views()
+        .iter()
+        .find(|view| view.name == "Vias_s")
+        .map(|view| view.scene.filtered_by_hierarchy_range(0, 2))
+        .expect("flat Vias_s view");
+
+    let hierarchical_bundle =
+        load_layout_hierarchy_bundle("/Users/liuyang/Desktop/xiaoyao/gdsii/vias_45.gds")
+            .expect("load hierarchical vias_45 bundle");
+    let root = hierarchical_bundle
+        .views()
+        .iter()
+        .find(|view| view.metadata().name() == "Vias_s")
+        .expect("hierarchical Vias_s root");
+    let hierarchical_scene = build_layout_view_scene(
+        &hierarchical_bundle,
+        LayoutViewBuildOptions::new(root.metadata().root_cell_id(), 0, 2),
+    )
+    .expect("hierarchical workset");
+
+    fn signature(scene: &Scene) -> Vec<(u32, u32, i32, i32, i32, i32, usize)> {
+        let mut items: Vec<_> = scene
+            .shapes()
+            .iter()
+            .map(|shape| {
+                (
+                    shape.layer.layer,
+                    shape.layer.datatype,
+                    shape.bounds.min_x.round() as i32,
+                    shape.bounds.min_y.round() as i32,
+                    shape.bounds.max_x.round() as i32,
+                    shape.bounds.max_y.round() as i32,
+                    shape.points.len(),
+                )
+            })
+            .collect();
+        items.sort_unstable();
+        items
+    }
+
+    assert_eq!(
+        flat_scene.stats().shape_count,
+        hierarchical_scene.stats().shape_count
+    );
+    assert_eq!(signature(&flat_scene), signature(&hierarchical_scene));
+}
+
+#[test]
+fn example_mzi_perf_fit_view_keeps_shallow_structure_while_collapsing_deep_subtrees() {
+    let hierarchical_bundle =
+        load_layout_hierarchy_bundle("/Users/liuyang/Desktop/xiaoyao/gdsii/example_mzi_perf.gds")
+            .expect("load hierarchical example_mzi_perf bundle");
+    let root = hierarchical_bundle
+        .views()
+        .iter()
+        .find(|view| view.metadata().name() == "MziArray")
+        .expect("hierarchical MziArray root");
+    let root_cell = hierarchical_bundle
+        .cell(root.metadata().root_cell_id())
+        .expect("MziArray root cell");
+
+    let viewport = Vec2::new(1600.0, 1200.0);
+    let mut camera = Camera2D::new();
+    camera.fit_bounds(root_cell.local_bounds().expect("MziArray bounds"), viewport);
+    let visible_world =
+        flayout_wgpu::renderer::geometry::camera_visible_world_bounds(&camera, viewport);
+
+    let full_scene = build_layout_view_scene(
+        &hierarchical_bundle,
+        LayoutViewBuildOptions::new(root.metadata().root_cell_id(), 0, 5)
+            .with_visible_world_bounds(Some(visible_world)),
+    )
+    .expect("full fit-view workset");
+    let lod_scene = build_layout_view_scene(
+        &hierarchical_bundle,
+        LayoutViewBuildOptions::new(root.metadata().root_cell_id(), 0, 5)
+            .with_visible_world_bounds(Some(visible_world))
+            .with_subtree_screen_lod(camera.zoom(), 2.0, 4),
+    )
+    .expect("lod fit-view workset");
+
+    let proxy_like_shape_count = lod_scene
+        .shapes()
+        .iter()
+        .filter(|shape| !shape.closed && shape.points.len() == 2)
+        .count();
+
+    assert_eq!(full_scene.bounds(), root_cell.local_bounds());
+    assert!(lod_scene.stats().shape_count > 1_000_000);
+    assert!(lod_scene.stats().shape_count < full_scene.stats().shape_count);
+    assert!(proxy_like_shape_count > 100_000);
+    assert!(proxy_like_shape_count < lod_scene.stats().shape_count);
 }

@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use flayout_wgpu::{
     layout::{
-        build_layout_view_scene, LayoutBundle, LayoutBundleError, LayoutCell, LayoutCellId,
-        LayoutInstance, LayoutRepetition, LayoutShape, LayoutTransform, LayoutView,
-        LayoutViewBuildOptions, LayoutViewMetadata,
+        LayoutBundle, LayoutBundleError, LayoutCell, LayoutCellId, LayoutInstance,
+        LayoutRepetition, LayoutShape, LayoutTransform, LayoutView, LayoutViewBuildOptions,
+        LayoutViewMetadata, build_layout_view_scene,
     },
     scene::{Bounds, LayerId},
 };
@@ -295,10 +295,12 @@ fn view_builder_expands_only_requested_hierarchy_levels() {
     )
     .expect("root-only scene");
     assert_eq!(root_only.stats().shape_count, 1);
-    assert!(root_only
-        .shapes()
-        .iter()
-        .all(|shape| shape.hierarchy_level == 0));
+    assert!(
+        root_only
+            .shapes()
+            .iter()
+            .all(|shape| shape.hierarchy_level == 0)
+    );
     assert_eq!(root_only.shapes()[0].layer, layer_root);
 
     let child_only = build_layout_view_scene(
@@ -307,10 +309,12 @@ fn view_builder_expands_only_requested_hierarchy_levels() {
     )
     .expect("child-only scene");
     assert_eq!(child_only.stats().shape_count, 1);
-    assert!(child_only
-        .shapes()
-        .iter()
-        .all(|shape| shape.hierarchy_level == 1));
+    assert!(
+        child_only
+            .shapes()
+            .iter()
+            .all(|shape| shape.hierarchy_level == 1)
+    );
     assert_eq!(child_only.shapes()[0].layer, layer_child);
 
     let grandchild_only = build_layout_view_scene(
@@ -319,10 +323,12 @@ fn view_builder_expands_only_requested_hierarchy_levels() {
     )
     .expect("grandchild-only scene");
     assert_eq!(grandchild_only.stats().shape_count, 1);
-    assert!(grandchild_only
-        .shapes()
-        .iter()
-        .all(|shape| shape.hierarchy_level == 2));
+    assert!(
+        grandchild_only
+            .shapes()
+            .iter()
+            .all(|shape| shape.hierarchy_level == 2)
+    );
     assert_eq!(grandchild_only.shapes()[0].layer, layer_grandchild);
 }
 
@@ -396,22 +402,24 @@ fn view_builder_expands_regular_grid_instances_into_flat_workset_shapes() {
         root_id,
         "root",
         Vec::new(),
-        vec![LayoutInstance::with_transform(
-            child_id,
-            Bounds::new(10.0, 20.0, 32.0, 42.0),
-            LayoutTransform {
-                translation: Vec2::new(10.0, 20.0),
-                rotation_degrees: 0.0,
-                magnification: 1.0,
-                mirrored_x: false,
-            },
-        )
-        .with_repetition(LayoutRepetition::regular_grid(
-            2,
-            2,
-            Vec2::new(20.0, 0.0),
-            Vec2::new(0.0, 20.0),
-        ))],
+        vec![
+            LayoutInstance::with_transform(
+                child_id,
+                Bounds::new(10.0, 20.0, 32.0, 42.0),
+                LayoutTransform {
+                    translation: Vec2::new(10.0, 20.0),
+                    rotation_degrees: 0.0,
+                    magnification: 1.0,
+                    mirrored_x: false,
+                },
+            )
+            .with_repetition(LayoutRepetition::regular_grid(
+                2,
+                2,
+                Vec2::new(20.0, 0.0),
+                Vec2::new(0.0, 20.0),
+            )),
+        ],
     ));
     let child = Arc::new(LayoutCell::new(
         child_id,
@@ -497,4 +505,144 @@ fn view_builder_preserves_path_stroke_width_through_expansion() {
     assert_eq!(scene.shapes()[0].stroke_width_world, Some(6.0));
     assert_eq!(scene.shapes()[0].points[0], Vec2::new(50.0, 60.0));
     assert_eq!(scene.shapes()[0].points[1], Vec2::new(70.0, 60.0));
+}
+
+#[test]
+fn view_builder_can_skip_tiny_subtrees_by_screen_extent() {
+    let root_id = LayoutCellId::new(500);
+    let child_id = LayoutCellId::new(501);
+    let grandchild_id = LayoutCellId::new(502);
+    let layer = sample_layer(50, 0);
+
+    let root = Arc::new(LayoutCell::new(
+        root_id,
+        "root",
+        Vec::new(),
+        vec![LayoutInstance::with_transform(
+            child_id,
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+            LayoutTransform {
+                translation: Vec2::ZERO,
+                rotation_degrees: 0.0,
+                magnification: 1.0,
+                mirrored_x: false,
+            },
+        )],
+    ));
+    let child = Arc::new(LayoutCell::new(
+        child_id,
+        "child",
+        Vec::new(),
+        vec![LayoutInstance::with_transform(
+            grandchild_id,
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+            LayoutTransform {
+                translation: Vec2::ZERO,
+                rotation_degrees: 0.0,
+                magnification: 1.0,
+                mirrored_x: false,
+            },
+        )],
+    ));
+    let grandchild = Arc::new(LayoutCell::new(
+        grandchild_id,
+        "leaf",
+        vec![LayoutShape::rectangle(
+            layer,
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+        )],
+        Vec::new(),
+    ));
+    let bundle = LayoutBundle::new(
+        vec![root, child, grandchild],
+        vec![LayoutView::new(LayoutViewMetadata::new("root", root_id))],
+    )
+    .expect("bundle should build");
+
+    let skipped = build_layout_view_scene(
+        &bundle,
+        LayoutViewBuildOptions::new(root_id, 0, 3)
+            .with_visible_world_bounds(None)
+            .with_subtree_screen_lod(1.0, 2.0, 2),
+    )
+    .expect("skipped scene");
+    assert_eq!(skipped.stats().shape_count, 1);
+    assert_eq!(skipped.shapes()[0].layer, layer);
+    assert!(!skipped.shapes()[0].closed);
+    assert_eq!(skipped.shapes()[0].points.len(), 2);
+
+    let expanded = build_layout_view_scene(
+        &bundle,
+        LayoutViewBuildOptions::new(root_id, 0, 3)
+            .with_visible_world_bounds(None)
+            .with_subtree_screen_lod(4.0, 2.0, 2),
+    )
+    .expect("expanded scene");
+    assert_eq!(expanded.stats().shape_count, 1);
+    assert_eq!(expanded.shapes()[0].layer, layer);
+}
+
+#[test]
+fn view_builder_does_not_collapse_shallow_subtrees_before_min_level() {
+    let root_id = LayoutCellId::new(510);
+    let child_id = LayoutCellId::new(511);
+    let grandchild_id = LayoutCellId::new(512);
+    let layer = sample_layer(51, 0);
+
+    let root = Arc::new(LayoutCell::new(
+        root_id,
+        "root",
+        Vec::new(),
+        vec![LayoutInstance::with_transform(
+            child_id,
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+            LayoutTransform {
+                translation: Vec2::ZERO,
+                rotation_degrees: 0.0,
+                magnification: 1.0,
+                mirrored_x: false,
+            },
+        )],
+    ));
+    let child = Arc::new(LayoutCell::new(
+        child_id,
+        "child",
+        Vec::new(),
+        vec![LayoutInstance::with_transform(
+            grandchild_id,
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+            LayoutTransform {
+                translation: Vec2::ZERO,
+                rotation_degrees: 0.0,
+                magnification: 1.0,
+                mirrored_x: false,
+            },
+        )],
+    ));
+    let grandchild = Arc::new(LayoutCell::new(
+        grandchild_id,
+        "leaf",
+        vec![LayoutShape::rectangle(
+            layer,
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+        )],
+        Vec::new(),
+    ));
+    let bundle = LayoutBundle::new(
+        vec![root, child, grandchild],
+        vec![LayoutView::new(LayoutViewMetadata::new("root", root_id))],
+    )
+    .expect("bundle should build");
+
+    let expanded = build_layout_view_scene(
+        &bundle,
+        LayoutViewBuildOptions::new(root_id, 0, 3)
+            .with_visible_world_bounds(None)
+            .with_subtree_screen_lod(1.0, 2.0, 4),
+    )
+    .expect("expanded scene");
+
+    assert_eq!(expanded.stats().shape_count, 1);
+    assert!(expanded.shapes()[0].closed);
+    assert!(expanded.shapes()[0].points.len() > 2);
 }

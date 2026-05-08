@@ -14,7 +14,7 @@ use std::{
 use glam::Vec2;
 
 use crate::scene::{Bounds, LayerId};
-pub use view_builder::{build_layout_view_scene, LayoutViewBuildError, LayoutViewBuildOptions};
+pub use view_builder::{LayoutViewBuildError, LayoutViewBuildOptions, build_layout_view_scene};
 
 /// 稳定的 cell 标识。
 ///

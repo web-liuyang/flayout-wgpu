@@ -19,8 +19,8 @@ use std::{
 };
 
 use egui_winit::State as EguiWinitState;
-use rfd::FileDialog;
 use glam::Vec2;
+use rfd::FileDialog;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -32,27 +32,37 @@ use crate::{
     camera::Camera2D,
     config::{DEFAULT_LAYOUT_PATH, INITIAL_HEIGHT, INITIAL_WIDTH, WINDOW_TITLE},
     io::{load_layout_bundle, load_layout_hierarchy_bundle},
-    layout::{build_layout_view_scene, LayoutBundle, LayoutCellId, LayoutViewBuildOptions},
+    layout::{LayoutBundle, LayoutCellId, LayoutViewBuildOptions, build_layout_view_scene},
     perf::{FrameStats, RenderStatsHistory},
     persistence::{
-        PersistedCamera, PersistedClosedShapeDrawMode, PersistedLayerDrawMode,
-        PersistedHatchStylePreset, PersistedLayerHatchStyle, PersistedLayerId, ViewerConfig,
+        PersistedCamera, PersistedClosedShapeDrawMode, PersistedHatchStylePreset,
+        PersistedLayerDrawMode, PersistedLayerHatchStyle, PersistedLayerId, ViewerConfig,
         filter_hidden_layers_for_scene, filter_layer_draw_modes_for_scene,
         filter_layer_hatch_styles_for_scene, load_viewer_config, resolve_saved_view_index,
         save_viewer_config,
     },
     renderer::{
-        RenderDebugStats, Renderer, DEFAULT_LAYER_BYPASS_ENTRY_THRESHOLD,
-        DEFAULT_LAYER_BYPASS_WORK_THRESHOLD, DEFAULT_PROGRESSIVE_BYPASS_THRESHOLD,
-        DEFAULT_TILE_CACHE_CAPACITY,
+        DEFAULT_LAYER_BYPASS_ENTRY_THRESHOLD, DEFAULT_LAYER_BYPASS_WORK_THRESHOLD,
+        DEFAULT_PROGRESSIVE_BYPASS_THRESHOLD, DEFAULT_TILE_CACHE_CAPACITY, RenderDebugStats,
+        Renderer,
         geometry::{
             ClosedShapeDrawMode, DEFAULT_HATCH_SPACING, DEFAULT_HATCH_WIDTH,
             DEFAULT_TILE_GRID_DIVISIONS, HatchParams, HatchStylePreset,
+            camera_visible_world_bounds,
         },
     },
-    scene::{LayerId, Scene, SceneBundle, SceneView},
+    scene::{Bounds, LayerId, Scene, SceneBundle, SceneView},
     ui::draw_ui,
 };
+
+const INITIAL_LAYOUT_WORKSET_SHAPE_BUDGET: u64 = 3_000_000;
+const INITIAL_LAYOUT_WORKSET_POINT_BUDGET: u64 = 20_000_000;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LayoutHierarchyLevelCost {
+    shape_count: u64,
+    point_count: u64,
+}
 
 /// 当前加载状态，用于左侧 UI 展示。
 #[derive(Debug, Clone)]
@@ -84,10 +94,7 @@ pub fn apply_pan_delta(current: Vec2, delta: Vec2) -> Vec2 {
 /// 之前 viewer 在 `about_to_wait` 里无条件 `request_redraw()`，
 /// 这会让重图层场景在"其实没有新的构建结果"时也持续整帧重画。
 /// 这里把策略收紧以后，交互仍然流畅，但空转重绘会明显减少。
-pub fn should_request_continuous_redraw(
-    pending_entries: usize,
-    egui_wants_repaint: bool,
-) -> bool {
+pub fn should_request_continuous_redraw(pending_entries: usize, egui_wants_repaint: bool) -> bool {
     egui_wants_repaint || pending_entries > 0
 }
 
@@ -103,22 +110,23 @@ pub fn should_request_redraw_after_window_event(
     egui_wants_repaint: bool,
     event: &WindowEvent,
 ) -> bool {
-    egui_wants_repaint || matches!(
-        event,
-        WindowEvent::CursorMoved { .. }
-            | WindowEvent::CursorEntered { .. }
-            | WindowEvent::CursorLeft { .. }
-            | WindowEvent::MouseInput { .. }
-            | WindowEvent::MouseWheel { .. }
-            | WindowEvent::KeyboardInput { .. }
-            | WindowEvent::TouchpadPressure { .. }
-            | WindowEvent::Touch { .. }
-            | WindowEvent::ModifiersChanged(..)
-            | WindowEvent::Ime(_)
-            | WindowEvent::PinchGesture { .. }
-            | WindowEvent::PanGesture { .. }
-            | WindowEvent::DoubleTapGesture { .. }
-            | WindowEvent::RotationGesture { .. }
+    egui_wants_repaint
+        || matches!(
+            event,
+            WindowEvent::CursorMoved { .. }
+                | WindowEvent::CursorEntered { .. }
+                | WindowEvent::CursorLeft { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::KeyboardInput { .. }
+                | WindowEvent::TouchpadPressure { .. }
+                | WindowEvent::Touch { .. }
+                | WindowEvent::ModifiersChanged(..)
+                | WindowEvent::Ime(_)
+                | WindowEvent::PinchGesture { .. }
+                | WindowEvent::PanGesture { .. }
+                | WindowEvent::DoubleTapGesture { .. }
+                | WindowEvent::RotationGesture { .. }
         )
 }
 
@@ -127,6 +135,22 @@ const INTERACTION_RENDER_DEGRADE_HOLD: Duration = Duration::from_millis(120);
 const SMALL_SCENE_SHAPE_THRESHOLD: usize = 50_000;
 /// 初始化层级范围时，判定“小版图”的点数阈值。
 const SMALL_SCENE_POINT_THRESHOLD: usize = 300_000;
+/// 分层 workset 的子树 screen-space LOD 阈值。
+///
+/// 当一个子树在屏幕上的最大包围尺寸已经小于这个阈值时，
+/// 继续向下展开往往只会显著放大内存和索引成本，但肉眼几乎看不出差别。
+const HIERARCHICAL_SUBTREE_MIN_SCREEN_EXTENT: f32 = 2.0;
+/// 只有足够深的 hierarchy 子树才允许做 screen-space 折叠。
+///
+/// 这样可以保住浅层阵列/骨架的整体形态，避免在全局 fit 时过早被压成 marker。
+const HIERARCHICAL_SUBTREE_MIN_COLLAPSE_LEVEL: u32 = 4;
+/// workset 视口裁剪会比当前可见视口多预取一圈，减少连续交互中的频繁重建。
+const LAYOUT_WORKSET_PREFETCH_MARGIN_RATIO: f32 = 0.25;
+/// 当前 zoom 相对上次 workset 构建 zoom 的允许漂移比例。
+///
+/// 在这个阈值内，小幅滚轮缩放直接复用当前 workset；
+/// 只有 zoom 变化足够明显时，才重新按新的 screen-space LOD 重建。
+const LAYOUT_WORKSET_REBUILD_ZOOM_RATIO_THRESHOLD: f32 = 1.2;
 
 /// 最近发生过平移/缩放时，是否应临时把闭合图形降级成更轻的显示模式。
 ///
@@ -140,6 +164,50 @@ pub fn should_degrade_interaction_render(
     elapsed_since_interaction
         .map(|elapsed| elapsed <= hold)
         .unwrap_or(false)
+}
+
+fn expand_layout_workset_visible_bounds(bounds: Bounds, margin_ratio: f32) -> Bounds {
+    Bounds::new(
+        bounds.min_x - bounds.width().max(0.0) * margin_ratio,
+        bounds.min_y - bounds.height().max(0.0) * margin_ratio,
+        bounds.max_x + bounds.width().max(0.0) * margin_ratio,
+        bounds.max_y + bounds.height().max(0.0) * margin_ratio,
+    )
+}
+
+fn bounds_contains_bounds(container: Bounds, candidate: Bounds) -> bool {
+    container.min_x <= candidate.min_x
+        && container.min_y <= candidate.min_y
+        && container.max_x >= candidate.max_x
+        && container.max_y >= candidate.max_y
+}
+
+fn should_rebuild_layout_workset_for_camera(
+    current_visible_world_bounds: Option<Bounds>,
+    current_zoom: f32,
+    covered_visible_world_bounds: Option<Bounds>,
+    covered_zoom: Option<f32>,
+) -> bool {
+    let Some(current_visible_world_bounds) = current_visible_world_bounds else {
+        return false;
+    };
+    let (Some(covered_visible_world_bounds), Some(covered_zoom)) =
+        (covered_visible_world_bounds, covered_zoom)
+    else {
+        return true;
+    };
+
+    if !bounds_contains_bounds(covered_visible_world_bounds, current_visible_world_bounds) {
+        return true;
+    }
+
+    let zoom_ratio = if covered_zoom.abs() <= f32::EPSILON {
+        f32::INFINITY
+    } else {
+        current_zoom / covered_zoom
+    };
+    zoom_ratio < (1.0 / LAYOUT_WORKSET_REBUILD_ZOOM_RATIO_THRESHOLD)
+        || zoom_ratio > LAYOUT_WORKSET_REBUILD_ZOOM_RATIO_THRESHOLD
 }
 
 /// 按 scene 的排序后 layer 索引给出默认 hatch preset。
@@ -245,6 +313,9 @@ pub struct ViewerApp {
     layer_bypass_work_threshold: usize,
     last_camera_interaction_at: Option<Instant>,
     interaction_view_dirty: bool,
+    layout_workset_visible_bounds: Option<Bounds>,
+    layout_workset_zoom: Option<f32>,
+    layout_workset_rebuild_pending: bool,
     /// 是否已经为当前会话初始化过 hierarchy level range。
     ///
     /// 如果没有旧配置可恢复，我们只在第一次加载 scene 时按复杂度生成默认值；
@@ -300,6 +371,9 @@ impl ViewerApp {
             layer_bypass_work_threshold: DEFAULT_LAYER_BYPASS_WORK_THRESHOLD,
             last_camera_interaction_at: None,
             interaction_view_dirty: false,
+            layout_workset_visible_bounds: None,
+            layout_workset_zoom: None,
+            layout_workset_rebuild_pending: false,
             hierarchy_level_range_initialized: false,
         };
 
@@ -354,7 +428,10 @@ impl ViewerApp {
     ///
     /// 这里只按“实例深度”计数，不关心一个实例重复多少次，
     /// 因为 repetition 会放大图形数量，但不会改变层级深度本身。
-    fn compute_layout_root_max_hierarchy_level(bundle: &LayoutBundle, root_cell_id: LayoutCellId) -> u32 {
+    fn compute_layout_root_max_hierarchy_level(
+        bundle: &LayoutBundle,
+        root_cell_id: LayoutCellId,
+    ) -> u32 {
         fn visit(
             bundle: &LayoutBundle,
             cell_id: LayoutCellId,
@@ -384,23 +461,114 @@ impl ViewerApp {
             depth
         }
 
-        visit(bundle, root_cell_id, &mut HashMap::new(), &mut BTreeSet::new())
+        visit(
+            bundle,
+            root_cell_id,
+            &mut HashMap::new(),
+            &mut BTreeSet::new(),
+        )
     }
 
-    /// 层次化路径下的一个保守默认范围。
+    fn estimate_layout_root_level_costs(
+        bundle: &LayoutBundle,
+        root_cell_id: LayoutCellId,
+    ) -> Vec<LayoutHierarchyLevelCost> {
+        fn repetition_factor(instance: &crate::layout::LayoutInstance) -> u64 {
+            match instance.repetition() {
+                Some(crate::layout::LayoutRepetition::RegularGrid { columns, rows, .. }) => {
+                    (*columns as u64).saturating_mul(*rows as u64)
+                }
+                None => 1,
+            }
+        }
+
+        fn visit(
+            bundle: &LayoutBundle,
+            cell_id: LayoutCellId,
+            cache: &mut HashMap<LayoutCellId, Vec<LayoutHierarchyLevelCost>>,
+            stack: &mut BTreeSet<LayoutCellId>,
+        ) -> Vec<LayoutHierarchyLevelCost> {
+            if let Some(cached) = cache.get(&cell_id) {
+                return cached.clone();
+            }
+            if !stack.insert(cell_id) {
+                return Vec::new();
+            }
+
+            let mut levels = vec![LayoutHierarchyLevelCost::default()];
+            if let Some(cell) = bundle.cell(cell_id) {
+                levels[0].shape_count = cell.local_shape_count() as u64;
+                levels[0].point_count = cell
+                    .local_shapes()
+                    .iter()
+                    .map(|shape| shape.points().len() as u64)
+                    .sum();
+
+                for instance in cell.instances() {
+                    let child_levels = visit(bundle, instance.target_cell_id(), cache, stack);
+                    let multiplier = repetition_factor(instance);
+                    if child_levels.is_empty() || multiplier == 0 {
+                        continue;
+                    }
+                    if levels.len() < child_levels.len() + 1 {
+                        levels.resize(child_levels.len() + 1, LayoutHierarchyLevelCost::default());
+                    }
+                    for (index, child_cost) in child_levels.iter().enumerate() {
+                        levels[index + 1].shape_count = levels[index + 1]
+                            .shape_count
+                            .saturating_add(child_cost.shape_count.saturating_mul(multiplier));
+                        levels[index + 1].point_count = levels[index + 1]
+                            .point_count
+                            .saturating_add(child_cost.point_count.saturating_mul(multiplier));
+                    }
+                }
+            }
+
+            stack.remove(&cell_id);
+            cache.insert(cell_id, levels.clone());
+            levels
+        }
+
+        visit(
+            bundle,
+            root_cell_id,
+            &mut HashMap::new(),
+            &mut BTreeSet::new(),
+        )
+    }
+
+    /// 层次化路径下的初始层级范围。
     ///
-    /// 这里不再为了算 shape/point 数去预展开整棵树，
-    /// 而是先只根据最大层级深度决定默认值：
-    /// - 深度较浅时直接全开
-    /// - 深度较深时先开前一半
-    fn recommended_initial_hierarchy_level_range_for_layout(max_level: u32) -> (u32, u32) {
-        if max_level <= 2 {
+    /// 这里不直接展开整棵树，而是先递归估算每一层累计的 shape/point 量，
+    /// 再选一个能把首帧 workset 控制在安全预算内的 `max_level`。
+    fn recommended_initial_hierarchy_level_range_for_layout(
+        bundle: &LayoutBundle,
+        root_cell_id: LayoutCellId,
+        max_level: u32,
+    ) -> (u32, u32) {
+        let level_costs = Self::estimate_layout_root_level_costs(bundle, root_cell_id);
+        if level_costs.is_empty() {
             return (0, max_level);
         }
 
-        let total_levels = max_level as usize + 1;
-        let visible_level_count = total_levels.div_ceil(2).max(1);
-        (0, (visible_level_count - 1) as u32)
+        let mut cumulative_shapes = 0u64;
+        let mut cumulative_points = 0u64;
+        let mut selected_max_level = 0u32;
+        for (index, cost) in level_costs.iter().enumerate() {
+            let next_shapes = cumulative_shapes.saturating_add(cost.shape_count);
+            let next_points = cumulative_points.saturating_add(cost.point_count);
+            if index > 0
+                && (next_shapes > INITIAL_LAYOUT_WORKSET_SHAPE_BUDGET
+                    || next_points > INITIAL_LAYOUT_WORKSET_POINT_BUDGET)
+            {
+                break;
+            }
+            cumulative_shapes = next_shapes;
+            cumulative_points = next_points;
+            selected_max_level = index as u32;
+        }
+
+        (0, selected_max_level.min(max_level))
     }
 
     /// 根据当前 source 重新计算真实可用的最大层级深度。
@@ -409,7 +577,10 @@ impl ViewerApp {
             layout_bundle
                 .selected_root_metadata()
                 .map(|metadata| {
-                    Self::compute_layout_root_max_hierarchy_level(layout_bundle, metadata.root_cell_id())
+                    Self::compute_layout_root_max_hierarchy_level(
+                        layout_bundle,
+                        metadata.root_cell_id(),
+                    )
                 })
                 .unwrap_or(0)
         } else {
@@ -424,21 +595,39 @@ impl ViewerApp {
     fn rebuild_scene_from_source(&mut self) {
         let max_available = self.available_max_hierarchy_level;
         self.min_hierarchy_level = self.min_hierarchy_level.min(max_available);
-        self.max_hierarchy_level = self.max_hierarchy_level.min(max_available).max(self.min_hierarchy_level);
+        self.max_hierarchy_level = self
+            .max_hierarchy_level
+            .min(max_available)
+            .max(self.min_hierarchy_level);
 
         self.scene = if let Some(layout_bundle) = &self.layout_bundle {
+            let visible_world_bounds = self.visible_world_bounds_for_layout_workset();
+            let workset_visible_world_bounds = visible_world_bounds.map(|bounds| {
+                expand_layout_workset_visible_bounds(bounds, LAYOUT_WORKSET_PREFETCH_MARGIN_RATIO)
+            });
+            let subtree_screen_lod = self.subtree_screen_lod_for_layout_workset();
             layout_bundle
                 .selected_root_metadata()
                 .and_then(|metadata| {
-                    build_layout_view_scene(
-                        layout_bundle,
-                        LayoutViewBuildOptions::new(
-                            metadata.root_cell_id(),
-                            self.min_hierarchy_level,
-                            self.max_hierarchy_level,
-                        ),
+                    let mut options = LayoutViewBuildOptions::new(
+                        metadata.root_cell_id(),
+                        self.min_hierarchy_level,
+                        self.max_hierarchy_level,
                     )
-                    .ok()
+                    .with_visible_world_bounds(workset_visible_world_bounds);
+                    if let Some((
+                        world_to_screen_scale,
+                        min_subtree_screen_extent,
+                        min_collapse_hierarchy_level,
+                    )) = subtree_screen_lod
+                    {
+                        options = options.with_subtree_screen_lod(
+                            world_to_screen_scale,
+                            min_subtree_screen_extent,
+                            min_collapse_hierarchy_level,
+                        );
+                    }
+                    build_layout_view_scene(layout_bundle, options).ok()
                 })
                 .map(Arc::new)
                 .unwrap_or_else(|| Arc::new(Scene::empty()))
@@ -452,12 +641,61 @@ impl ViewerApp {
             {
                 base_scene
             } else {
-                Arc::new(
-                    base_scene
-                        .filtered_by_hierarchy_range(self.min_hierarchy_level, self.max_hierarchy_level),
-                )
+                Arc::new(base_scene.filtered_by_hierarchy_range(
+                    self.min_hierarchy_level,
+                    self.max_hierarchy_level,
+                ))
             }
         };
+        if self.layout_bundle.is_some() {
+            self.layout_workset_visible_bounds = self
+                .visible_world_bounds_for_layout_workset()
+                .map(|bounds| {
+                    expand_layout_workset_visible_bounds(
+                        bounds,
+                        LAYOUT_WORKSET_PREFETCH_MARGIN_RATIO,
+                    )
+                });
+            self.layout_workset_zoom = self
+                .subtree_screen_lod_for_layout_workset()
+                .map(|(zoom, _, _)| zoom);
+        } else {
+            self.layout_workset_visible_bounds = None;
+            self.layout_workset_zoom = None;
+        }
+    }
+
+    /// 给分层 workset builder 计算当前可用的视口 world bounds。
+    ///
+    /// 这里故意在首次 fit 之前返回 `None`：
+    /// - 初始加载时我们还不知道“用户真正想看的视口”
+    /// - 如果过早裁剪，第一次 fit 可能只会对着左上角那一小块内容做适配
+    fn visible_world_bounds_for_layout_workset(&self) -> Option<Bounds> {
+        if self.layout_bundle.is_none() || !self.initialized_camera {
+            return None;
+        }
+        if self.canvas_size.x <= 0.0 || self.canvas_size.y <= 0.0 {
+            return None;
+        }
+
+        Some(camera_visible_world_bounds(&self.camera, self.canvas_size))
+    }
+
+    /// 给分层 workset 提供一层轻量的 screen-space 子树 LOD。
+    ///
+    /// 这里和 renderer 的点列 coarse LOD 互补：
+    /// - renderer LOD：图形已经展开后，少画一些点
+    /// - 这里：在递归展开前，就别把肉眼几乎看不出的深层子树整棵拉进来
+    fn subtree_screen_lod_for_layout_workset(&self) -> Option<(f32, f32, u32)> {
+        if self.layout_bundle.is_none() || !self.initialized_camera {
+            return None;
+        }
+
+        Some((
+            self.camera.zoom(),
+            HIERARCHICAL_SUBTREE_MIN_SCREEN_EXTENT,
+            HIERARCHICAL_SUBTREE_MIN_COLLAPSE_LEVEL,
+        ))
     }
 
     /// 初始化或收紧当前的层级范围。
@@ -467,11 +705,26 @@ impl ViewerApp {
     fn initialize_or_clamp_hierarchy_level_range(&mut self, recompute_defaults: bool) {
         if recompute_defaults || !self.hierarchy_level_range_initialized {
             let (min_level, max_level) = if self.layout_bundle.is_some() {
-                Self::recommended_initial_hierarchy_level_range_for_layout(
-                    self.available_max_hierarchy_level,
-                )
+                self.layout_bundle
+                    .as_ref()
+                    .and_then(|bundle| {
+                        bundle.selected_root_metadata().map(|metadata| {
+                            Self::recommended_initial_hierarchy_level_range_for_layout(
+                                bundle,
+                                metadata.root_cell_id(),
+                                self.available_max_hierarchy_level,
+                            )
+                        })
+                    })
+                    .unwrap_or((0, self.available_max_hierarchy_level))
             } else {
-                recommended_initial_hierarchy_level_range(&self.scene_bundle.current_scene().cloned().unwrap_or_else(Scene::empty))
+                recommended_initial_hierarchy_level_range(
+                    &self
+                        .scene_bundle
+                        .current_scene()
+                        .cloned()
+                        .unwrap_or_else(Scene::empty),
+                )
             };
             self.min_hierarchy_level = min_level;
             self.max_hierarchy_level = max_level;
@@ -479,7 +732,10 @@ impl ViewerApp {
         } else {
             let max_available = self.available_max_hierarchy_level;
             self.min_hierarchy_level = self.min_hierarchy_level.min(max_available);
-            self.max_hierarchy_level = self.max_hierarchy_level.min(max_available).max(self.min_hierarchy_level);
+            self.max_hierarchy_level = self
+                .max_hierarchy_level
+                .min(max_available)
+                .max(self.min_hierarchy_level);
         }
     }
 
@@ -498,9 +754,51 @@ impl ViewerApp {
         }
     }
 
+    fn clear_layout_workset_tracking(&mut self) {
+        self.layout_workset_visible_bounds = None;
+        self.layout_workset_zoom = None;
+        self.layout_workset_rebuild_pending = false;
+    }
+
+    fn layout_scene_rebuild_needed_for_current_camera(&self) -> bool {
+        if self.layout_bundle.is_none() || !self.initialized_camera {
+            return false;
+        }
+
+        let current_visible_world_bounds = self.visible_world_bounds_for_layout_workset();
+        should_rebuild_layout_workset_for_camera(
+            current_visible_world_bounds,
+            self.camera.zoom(),
+            self.layout_workset_visible_bounds,
+            self.layout_workset_zoom,
+        )
+    }
+
+    fn refresh_layout_scene_if_camera_requires_rebuild(&mut self) {
+        let interaction_degraded = should_degrade_interaction_render(
+            self.last_camera_interaction_at.map(|last| last.elapsed()),
+            INTERACTION_RENDER_DEGRADE_HOLD,
+        );
+
+        if !self.layout_scene_rebuild_needed_for_current_camera() {
+            self.layout_workset_rebuild_pending = false;
+            return;
+        }
+
+        if interaction_degraded {
+            self.layout_workset_rebuild_pending = true;
+        } else {
+            self.refresh_filtered_scene_and_renderer();
+            self.layout_workset_rebuild_pending = false;
+        }
+    }
+
     /// 当用户把 `max level` 调到当前已加载深度之外时，重新加载当前 view。
     fn ensure_loaded_hierarchy_capacity(&mut self, requested_max_level: u32) {
-        if self.layout_bundle.is_some() || requested_max_level <= self.scene.max_hierarchy_level() || requested_max_level > self.available_max_hierarchy_level {
+        if self.layout_bundle.is_some()
+            || requested_max_level <= self.scene.max_hierarchy_level()
+            || requested_max_level > self.available_max_hierarchy_level
+        {
             return;
         }
 
@@ -512,18 +810,12 @@ impl ViewerApp {
             self.refresh_available_hierarchy_level_limit();
             let empty_scene = Scene::empty();
             let reference_scene = self.scene_bundle.current_scene().unwrap_or(&empty_scene);
-            self.hidden_layers = filter_hidden_layers_for_scene(
-                &self.collect_viewer_config(),
-                reference_scene,
-            );
-            self.layer_draw_modes = filter_layer_draw_modes_for_scene(
-                &self.collect_viewer_config(),
-                reference_scene,
-            );
-            self.layer_hatch_styles = filter_layer_hatch_styles_for_scene(
-                &self.collect_viewer_config(),
-                reference_scene,
-            );
+            self.hidden_layers =
+                filter_hidden_layers_for_scene(&self.collect_viewer_config(), reference_scene);
+            self.layer_draw_modes =
+                filter_layer_draw_modes_for_scene(&self.collect_viewer_config(), reference_scene);
+            self.layer_hatch_styles =
+                filter_layer_hatch_styles_for_scene(&self.collect_viewer_config(), reference_scene);
         }
     }
 
@@ -598,7 +890,8 @@ impl ViewerApp {
             Ok((Some(layout_bundle), None)) => {
                 self.layout_bundle = Some(layout_bundle);
                 if let Some(layout_bundle) = &self.layout_bundle {
-                    self.scene_bundle = Self::placeholder_scene_bundle_from_layout_bundle(layout_bundle);
+                    self.scene_bundle =
+                        Self::placeholder_scene_bundle_from_layout_bundle(layout_bundle);
                 }
                 self.load_state = LoadState::Loaded;
                 self.refresh_available_hierarchy_level_limit();
@@ -609,6 +902,7 @@ impl ViewerApp {
                     self.hidden_layers.clear();
                     self.layer_draw_modes.clear();
                     self.layer_hatch_styles.clear();
+                    self.clear_layout_workset_tracking();
                     self.initialize_or_clamp_hierarchy_level_range(
                         !self.hierarchy_level_range_initialized,
                     );
@@ -628,6 +922,7 @@ impl ViewerApp {
                     self.hidden_layers.clear();
                     self.layer_draw_modes.clear();
                     self.layer_hatch_styles.clear();
+                    self.clear_layout_workset_tracking();
                     self.initialize_or_clamp_hierarchy_level_range(
                         !self.hierarchy_level_range_initialized,
                     );
@@ -649,6 +944,7 @@ impl ViewerApp {
                 self.available_max_hierarchy_level = 0;
                 self.hierarchy_level_range_initialized = false;
                 self.initialized_camera = false;
+                self.clear_layout_workset_tracking();
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.update_scene(Arc::clone(&self.scene));
                 }
@@ -723,7 +1019,9 @@ impl ViewerApp {
 
     /// 在当前 scene 已经加载完成后，应用持久化配置里的 scene 相关状态。
     fn apply_persisted_scene_config(&mut self, config: &ViewerConfig) {
-        if let Some(index) = resolve_saved_view_index(&self.scene_bundle, config.selected_view_name.as_deref()) {
+        if let Some(index) =
+            resolve_saved_view_index(&self.scene_bundle, config.selected_view_name.as_deref())
+        {
             let _ = self.scene_bundle.select(index);
             if let Some(layout_bundle) = self.layout_bundle.as_mut() {
                 let _ = layout_bundle.select(index);
@@ -747,9 +1045,12 @@ impl ViewerApp {
         self.layer_hatch_styles = filter_layer_hatch_styles_for_scene(config, &self.scene);
         self.sync_layer_hatch_styles_with_scene();
         self.refresh_filtered_scene_and_renderer();
-        self.camera
-            .set_state(Vec2::new(config.camera.pan_x, config.camera.pan_y), config.camera.zoom);
+        self.camera.set_state(
+            Vec2::new(config.camera.pan_x, config.camera.pan_y),
+            config.camera.zoom,
+        );
         self.initialized_camera = true;
+        self.refresh_filtered_scene_and_renderer();
     }
 
     /// 将当前 viewer 配置保存到用户配置文件。
@@ -773,6 +1074,7 @@ impl ViewerApp {
             self.hidden_layers.clear();
             self.initialize_or_clamp_hierarchy_level_range(false);
             self.initialized_camera = false;
+            self.clear_layout_workset_tracking();
             self.refresh_filtered_scene_and_renderer();
             return;
         }
@@ -789,16 +1091,24 @@ impl ViewerApp {
         self.hidden_layers.clear();
         self.initialize_or_clamp_hierarchy_level_range(false);
         self.initialized_camera = false;
+        self.clear_layout_workset_tracking();
         self.refresh_filtered_scene_and_renderer();
     }
 
     /// 将当前场景 fit 到画布。
     fn fit_scene(&mut self) {
-        if let Some(bounds) = self.scene.bounds() {
-            if self.canvas_size.x > 0.0 && self.canvas_size.y > 0.0 {
-                self.camera.fit_bounds(bounds, self.canvas_size);
-                self.initialized_camera = true;
-            }
+        if self.canvas_size.x <= 0.0 || self.canvas_size.y <= 0.0 {
+            return;
+        }
+        let bounds = self
+            .layout_bundle
+            .as_ref()
+            .and_then(LayoutBundle::selected_root_cell)
+            .and_then(|cell| cell.local_bounds())
+            .or_else(|| self.scene.bounds());
+        if let Some(bounds) = bounds {
+            self.camera.fit_bounds(bounds, self.canvas_size);
+            self.initialized_camera = true;
         }
     }
 
@@ -863,7 +1173,14 @@ impl ViewerApp {
             });
             egui_state.handle_platform_output(&window, full_output.platform_output.clone());
 
+            let previous_canvas_size = self.canvas_size;
             self.canvas_size = action.canvas_size.max(Vec2::new(1.0, 1.0));
+            if self.layout_bundle.is_some()
+                && self.initialized_camera
+                && self.canvas_size != previous_canvas_size
+            {
+                self.refresh_layout_scene_if_camera_requires_rebuild();
+            }
             if let Some(index) = action.selected_view {
                 self.select_scene_view(index);
             }
@@ -949,25 +1266,31 @@ impl ViewerApp {
             }
             if !self.initialized_camera || action.request_fit {
                 self.fit_scene();
+                if self.layout_bundle.is_some() && self.initialized_camera {
+                    self.refresh_filtered_scene_and_renderer();
+                }
             }
             if action.pan_delta != Vec2::ZERO {
                 self.camera.translate_screen(action.pan_delta);
                 self.initialized_camera = true;
                 self.last_camera_interaction_at = Some(now);
                 self.interaction_view_dirty = true;
-                self.interaction_view_dirty = true;
+                self.refresh_layout_scene_if_camera_requires_rebuild();
             }
             if let Some((factor, cursor)) = action.zoom {
                 self.camera.zoom_by(factor, cursor);
                 self.initialized_camera = true;
                 self.last_camera_interaction_at = Some(now);
+                self.interaction_view_dirty = true;
+                self.refresh_layout_scene_if_camera_requires_rebuild();
             }
 
             (action.canvas_origin, full_output)
         };
 
         let interaction_degraded = should_degrade_interaction_render(
-            self.last_camera_interaction_at.map(|last| now.duration_since(last)),
+            self.last_camera_interaction_at
+                .map(|last| now.duration_since(last)),
             INTERACTION_RENDER_DEGRADE_HOLD,
         );
 
@@ -1004,6 +1327,11 @@ impl ViewerApp {
             }
             Err(wgpu::SurfaceError::Timeout) => {}
             Err(wgpu::SurfaceError::Other) => {}
+        }
+
+        if !interaction_degraded && self.layout_workset_rebuild_pending {
+            self.refresh_layout_scene_if_camera_requires_rebuild();
+            self.request_redraw();
         }
     }
 }
@@ -1070,7 +1398,10 @@ impl ApplicationHandler for ViewerApp {
         if should_request_continuous_redraw(
             self.render_debug_stats.pending_entries,
             self.egui_ctx.has_requested_repaint(),
-        ) || interaction_degraded || self.interaction_view_dirty {
+        ) || interaction_degraded
+            || self.interaction_view_dirty
+            || self.layout_workset_rebuild_pending
+        {
             self.request_redraw();
         }
     }
@@ -1152,6 +1483,154 @@ mod tests {
         .expect("hierarchical bundle")
     }
 
+    fn sample_tiny_subtree_bundle() -> LayoutBundle {
+        let root_id = LayoutCellId::new(10);
+        let child_id = LayoutCellId::new(11);
+        let grandchild_id = LayoutCellId::new(12);
+        let great_grandchild_id = LayoutCellId::new(13);
+        let leaf_id = LayoutCellId::new(14);
+
+        let root = Arc::new(LayoutCell::new(
+            root_id,
+            "root",
+            Vec::new(),
+            vec![crate::layout::LayoutInstance::with_transform(
+                child_id,
+                Bounds::new(0.0, 0.0, 1.0, 1.0),
+                crate::layout::LayoutTransform {
+                    translation: Vec2::ZERO,
+                    rotation_degrees: 0.0,
+                    magnification: 1.0,
+                    mirrored_x: false,
+                },
+            )],
+        ));
+        let child = Arc::new(LayoutCell::new(
+            child_id,
+            "child",
+            Vec::new(),
+            vec![crate::layout::LayoutInstance::with_transform(
+                grandchild_id,
+                Bounds::new(0.0, 0.0, 1.0, 1.0),
+                crate::layout::LayoutTransform {
+                    translation: Vec2::ZERO,
+                    rotation_degrees: 0.0,
+                    magnification: 1.0,
+                    mirrored_x: false,
+                },
+            )],
+        ));
+        let grandchild = Arc::new(LayoutCell::new(
+            grandchild_id,
+            "grandchild",
+            Vec::new(),
+            vec![crate::layout::LayoutInstance::with_transform(
+                great_grandchild_id,
+                Bounds::new(0.0, 0.0, 1.0, 1.0),
+                crate::layout::LayoutTransform {
+                    translation: Vec2::ZERO,
+                    rotation_degrees: 0.0,
+                    magnification: 1.0,
+                    mirrored_x: false,
+                },
+            )],
+        ));
+        let great_grandchild = Arc::new(LayoutCell::new(
+            great_grandchild_id,
+            "great-grandchild",
+            Vec::new(),
+            vec![crate::layout::LayoutInstance::with_transform(
+                leaf_id,
+                Bounds::new(0.0, 0.0, 1.0, 1.0),
+                crate::layout::LayoutTransform {
+                    translation: Vec2::ZERO,
+                    rotation_degrees: 0.0,
+                    magnification: 1.0,
+                    mirrored_x: false,
+                },
+            )],
+        ));
+        let leaf = Arc::new(LayoutCell::new(
+            leaf_id,
+            "leaf",
+            vec![LayoutShape::rectangle(
+                sample_layer(20),
+                Bounds::new(0.0, 0.0, 1.0, 1.0),
+            )],
+            Vec::new(),
+        ));
+
+        LayoutBundle::new(
+            vec![root, child, grandchild, great_grandchild, leaf],
+            vec![LayoutView::new(LayoutViewMetadata::new("root", root_id))],
+        )
+        .expect("tiny subtree bundle")
+    }
+
+    fn sample_large_repetition_bundle() -> LayoutBundle {
+        let root_id = LayoutCellId::new(30);
+        let child_id = LayoutCellId::new(31);
+        let leaf_id = LayoutCellId::new(32);
+
+        let root = Arc::new(LayoutCell::new(
+            root_id,
+            "root",
+            vec![LayoutShape::rectangle(
+                sample_layer(30),
+                Bounds::new(0.0, 0.0, 1.0, 1.0),
+            )],
+            vec![
+                crate::layout::LayoutInstance::with_transform(
+                    child_id,
+                    Bounds::new(0.0, 0.0, 10.0, 10.0),
+                    crate::layout::LayoutTransform::identity(),
+                )
+                .with_repetition(crate::layout::LayoutRepetition::regular_grid(
+                    2_000,
+                    1,
+                    Vec2::new(20.0, 0.0),
+                    Vec2::new(0.0, 20.0),
+                )),
+            ],
+        ));
+        let child = Arc::new(LayoutCell::new(
+            child_id,
+            "child",
+            vec![LayoutShape::rectangle(
+                sample_layer(31),
+                Bounds::new(0.0, 0.0, 2.0, 2.0),
+            )],
+            vec![
+                crate::layout::LayoutInstance::with_transform(
+                    leaf_id,
+                    Bounds::new(0.0, 0.0, 5.0, 5.0),
+                    crate::layout::LayoutTransform::identity(),
+                )
+                .with_repetition(crate::layout::LayoutRepetition::regular_grid(
+                    2_000,
+                    1,
+                    Vec2::new(10.0, 0.0),
+                    Vec2::new(0.0, 10.0),
+                )),
+            ],
+        ));
+        let leaf = Arc::new(LayoutCell::new(
+            leaf_id,
+            "leaf",
+            vec![LayoutShape::rectangle(
+                sample_layer(32),
+                Bounds::new(0.0, 0.0, 3.0, 3.0),
+            )],
+            Vec::new(),
+        ));
+
+        LayoutBundle::new(
+            vec![root, child, leaf],
+            vec![LayoutView::new(LayoutViewMetadata::new("root", root_id))],
+        )
+        .expect("large repetition bundle")
+    }
+
     #[test]
     fn hierarchical_source_rebuilds_scene_when_level_range_changes() {
         let layout_bundle = sample_hierarchical_bundle();
@@ -1166,7 +1645,12 @@ mod tests {
         app.refresh_filtered_scene_and_renderer();
         assert_eq!(app.available_max_hierarchy_level, 2);
         assert_eq!(app.scene.stats().shape_count, 1);
-        assert!(app.scene.shapes().iter().all(|shape| shape.hierarchy_level == 0));
+        assert!(
+            app.scene
+                .shapes()
+                .iter()
+                .all(|shape| shape.hierarchy_level == 0)
+        );
 
         app.max_hierarchy_level = 1;
         app.refresh_filtered_scene_and_renderer();
@@ -1177,6 +1661,191 @@ mod tests {
         app.refresh_filtered_scene_and_renderer();
         assert_eq!(app.scene.stats().shape_count, 3);
         assert_eq!(app.scene.max_hierarchy_level(), 2);
+    }
+
+    #[test]
+    fn hierarchical_source_clips_workset_by_visible_world_bounds() {
+        let layout_bundle = sample_hierarchical_bundle();
+        let mut app = ViewerApp::new();
+        app.layout_bundle = Some(layout_bundle.clone());
+        app.scene_bundle = ViewerApp::placeholder_scene_bundle_from_layout_bundle(&layout_bundle);
+        app.refresh_available_hierarchy_level_limit();
+
+        app.canvas_size = Vec2::new(15.0, 15.0);
+        app.min_hierarchy_level = 0;
+        app.max_hierarchy_level = 1;
+        app.hierarchy_level_range_initialized = true;
+        app.initialized_camera = true;
+
+        app.camera.set_state(Vec2::ZERO, 1.0);
+        app.refresh_filtered_scene_and_renderer();
+        assert_eq!(app.scene.stats().shape_count, 1);
+        assert_eq!(app.scene.shapes()[0].layer, sample_layer(10));
+
+        app.camera.set_state(Vec2::new(-20.0, 0.0), 1.0);
+        app.refresh_filtered_scene_and_renderer();
+        assert_eq!(app.scene.stats().shape_count, 1);
+        assert_eq!(app.scene.shapes()[0].layer, sample_layer(11));
+    }
+
+    #[test]
+    fn hierarchical_source_skips_tiny_subtrees_when_zoomed_out() {
+        let layout_bundle = sample_tiny_subtree_bundle();
+        let mut app = ViewerApp::new();
+        app.layout_bundle = Some(layout_bundle.clone());
+        app.scene_bundle = ViewerApp::placeholder_scene_bundle_from_layout_bundle(&layout_bundle);
+        app.refresh_available_hierarchy_level_limit();
+
+        app.canvas_size = Vec2::new(100.0, 100.0);
+        app.min_hierarchy_level = 0;
+        app.max_hierarchy_level = 5;
+        app.hierarchy_level_range_initialized = true;
+        app.initialized_camera = true;
+
+        app.camera.set_state(Vec2::ZERO, 1.0);
+        app.refresh_filtered_scene_and_renderer();
+        assert_eq!(app.scene.stats().shape_count, 1);
+        assert_eq!(app.scene.shapes()[0].layer, sample_layer(20));
+
+        app.camera.set_state(Vec2::ZERO, 4.0);
+        app.refresh_filtered_scene_and_renderer();
+        assert_eq!(app.scene.stats().shape_count, 1);
+        assert_eq!(app.scene.shapes()[0].layer, sample_layer(20));
+    }
+
+    #[test]
+    fn hierarchical_fit_scene_uses_full_source_bounds_not_current_workset_bounds() {
+        let layout_bundle = sample_hierarchical_bundle();
+        let mut app = ViewerApp::new();
+        app.layout_bundle = Some(layout_bundle.clone());
+        app.scene_bundle = ViewerApp::placeholder_scene_bundle_from_layout_bundle(&layout_bundle);
+        app.refresh_available_hierarchy_level_limit();
+
+        app.canvas_size = Vec2::new(100.0, 100.0);
+        app.min_hierarchy_level = 0;
+        app.max_hierarchy_level = 2;
+        app.hierarchy_level_range_initialized = true;
+        app.initialized_camera = true;
+
+        app.camera.set_state(Vec2::new(-50.0, 0.0), 1.0);
+        app.refresh_filtered_scene_and_renderer();
+        assert!(app.scene.bounds().map(|bounds| bounds.min_x).unwrap_or(0.0) > 0.0);
+
+        app.fit_scene();
+
+        assert!(app.camera.zoom() < 4.0);
+    }
+
+    #[test]
+    fn hierarchical_initial_range_for_large_layout_stops_before_budget_explodes() {
+        let layout_bundle = sample_large_repetition_bundle();
+        let root_id = layout_bundle
+            .selected_root_metadata()
+            .expect("root metadata")
+            .root_cell_id();
+        let max_level = ViewerApp::compute_layout_root_max_hierarchy_level(&layout_bundle, root_id);
+
+        let (min_level, max_level_selected) =
+            ViewerApp::recommended_initial_hierarchy_level_range_for_layout(
+                &layout_bundle,
+                root_id,
+                max_level,
+            );
+
+        assert_eq!(min_level, 0);
+        assert_eq!(max_level, 2);
+        assert_eq!(max_level_selected, 1);
+    }
+
+    #[test]
+    fn layout_workset_camera_rebuild_is_skipped_inside_prefetch_margin() {
+        let coverage = Bounds::new(-10.0, -10.0, 110.0, 110.0);
+        let visible = Bounds::new(0.0, 0.0, 100.0, 100.0);
+
+        assert!(!should_rebuild_layout_workset_for_camera(
+            Some(visible),
+            1.05,
+            Some(coverage),
+            Some(1.0),
+        ));
+    }
+
+    #[test]
+    fn layout_workset_camera_rebuild_triggers_when_view_leaves_prefetch_margin() {
+        let coverage = Bounds::new(-10.0, -10.0, 110.0, 110.0);
+        let visible = Bounds::new(20.0, 0.0, 120.0, 100.0);
+
+        assert!(should_rebuild_layout_workset_for_camera(
+            Some(visible),
+            1.0,
+            Some(coverage),
+            Some(1.0),
+        ));
+    }
+
+    #[test]
+    fn layout_workset_camera_rebuild_triggers_when_zoom_changes_too_much() {
+        let coverage = Bounds::new(-10.0, -10.0, 110.0, 110.0);
+        let visible = Bounds::new(0.0, 0.0, 100.0, 100.0);
+
+        assert!(should_rebuild_layout_workset_for_camera(
+            Some(visible),
+            1.3,
+            Some(coverage),
+            Some(1.0),
+        ));
+    }
+
+    #[test]
+    fn layout_workset_camera_rebuild_is_deferred_while_interaction_is_active() {
+        let layout_bundle = sample_hierarchical_bundle();
+        let mut app = ViewerApp::new();
+        app.layout_bundle = Some(layout_bundle.clone());
+        app.scene_bundle = ViewerApp::placeholder_scene_bundle_from_layout_bundle(&layout_bundle);
+        app.refresh_available_hierarchy_level_limit();
+        app.canvas_size = Vec2::new(15.0, 15.0);
+        app.min_hierarchy_level = 0;
+        app.max_hierarchy_level = 1;
+        app.hierarchy_level_range_initialized = true;
+        app.initialized_camera = true;
+
+        app.camera.set_state(Vec2::ZERO, 1.0);
+        app.refresh_filtered_scene_and_renderer();
+        let previous_bounds = app.scene.bounds();
+
+        app.camera.set_state(Vec2::new(-20.0, 0.0), 1.0);
+        app.last_camera_interaction_at = Some(Instant::now());
+        app.refresh_layout_scene_if_camera_requires_rebuild();
+
+        assert!(app.layout_workset_rebuild_pending);
+        assert_eq!(app.scene.bounds(), previous_bounds);
+    }
+
+    #[test]
+    fn layout_workset_camera_rebuild_executes_after_interaction_settles() {
+        let layout_bundle = sample_hierarchical_bundle();
+        let mut app = ViewerApp::new();
+        app.layout_bundle = Some(layout_bundle.clone());
+        app.scene_bundle = ViewerApp::placeholder_scene_bundle_from_layout_bundle(&layout_bundle);
+        app.refresh_available_hierarchy_level_limit();
+        app.canvas_size = Vec2::new(15.0, 15.0);
+        app.min_hierarchy_level = 0;
+        app.max_hierarchy_level = 1;
+        app.hierarchy_level_range_initialized = true;
+        app.initialized_camera = true;
+
+        app.camera.set_state(Vec2::ZERO, 1.0);
+        app.refresh_filtered_scene_and_renderer();
+
+        app.camera.set_state(Vec2::new(-20.0, 0.0), 1.0);
+        app.last_camera_interaction_at =
+            Some(Instant::now() - INTERACTION_RENDER_DEGRADE_HOLD - Duration::from_millis(1));
+        app.layout_workset_rebuild_pending = true;
+        app.refresh_layout_scene_if_camera_requires_rebuild();
+
+        assert!(!app.layout_workset_rebuild_pending);
+        assert_eq!(app.scene.stats().shape_count, 1);
+        assert_eq!(app.scene.shapes()[0].layer, sample_layer(11));
     }
 
     #[test]

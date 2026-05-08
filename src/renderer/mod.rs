@@ -35,8 +35,8 @@ use self::{
     geometry::{
         ClosedShapeDrawMode, DEFAULT_HATCH_SPACING, DEFAULT_HATCH_STYLE_PRESET,
         DEFAULT_HATCH_WIDTH, DEFAULT_TILE_GRID_DIVISIONS, HatchParams, HatchStylePreset,
-        LARGE_SHAPE_PRE_FRAGMENT_TILE_THRESHOLD, LineVertex, PreparedTileFragments,
-        RenderCacheKey, ShapeSpatialIndex, TileGridIndex, TileId, build_hatch_signature,
+        LARGE_SHAPE_PRE_FRAGMENT_TILE_THRESHOLD, LineVertex, PreparedTileFragments, RenderCacheKey,
+        ShapeSpatialIndex, TileGridIndex, TileId, build_hatch_signature,
         build_hatch_style_signature, build_render_cache_key_with_hatch_styles,
         build_scaled_scene_vertices_for_prepared_fragments_with_hatch_styles,
         build_scaled_scene_vertices_for_tile, camera_visible_world_bounds,
@@ -214,7 +214,6 @@ struct TileCacheDomainKey {
     hatch_style_signature: u64,
 }
 
-
 /// 一条等待构建的 `tile + layer` 缓存请求。
 ///
 /// 渐进式渲染的关键点不是“把所有东西都算完”，
@@ -240,6 +239,11 @@ struct TileCacheEntry {
 
 /// 默认 tile cache 条目上限。
 pub const DEFAULT_TILE_CACHE_CAPACITY: usize = 512;
+/// 估算每个 tile cache 条目默认可占用的字节预算。
+///
+/// 这里先给一个保守上限，避免“条目数不多，但每个条目都特别大”时，
+/// 仅靠 entry 数量上限仍然把内存一路顶高。
+const TILE_CACHE_BYTES_PER_ENTRY_BUDGET: usize = 512 * 1024;
 
 /// 每一帧最多新构建多少个 `tile + layer` 缓存条目。
 ///
@@ -522,7 +526,6 @@ impl Renderer {
         self.debug_stats.cache_hit = false;
     }
 
-
     /// 切换闭合图形显示模式。
     ///
     /// 这个模式会直接影响 tile buffer 内容，
@@ -608,7 +611,12 @@ impl Renderer {
         }
 
         self.tile_cache_capacity = capacity;
-        let evicted = prune_tile_cache(&mut self.tile_vertex_cache, capacity, &std::collections::HashSet::new());
+        let evicted = prune_tile_cache(
+            &mut self.tile_vertex_cache,
+            capacity,
+            tile_cache_byte_budget(capacity),
+            &std::collections::HashSet::new(),
+        );
         self.total_cache_evictions += evicted;
         self.cached_scene_key = None;
         self.requested_tile_keys.clear();
@@ -619,7 +627,10 @@ impl Renderer {
 
     /// 调整“轻场景直接补完”的阈值。
     pub fn set_progressive_bypass_threshold(&mut self, threshold: usize) {
-        let threshold = threshold.clamp(MIN_PROGRESSIVE_BYPASS_THRESHOLD, MAX_PROGRESSIVE_BYPASS_THRESHOLD);
+        let threshold = threshold.clamp(
+            MIN_PROGRESSIVE_BYPASS_THRESHOLD,
+            MAX_PROGRESSIVE_BYPASS_THRESHOLD,
+        );
         if self.progressive_bypass_threshold == threshold {
             return;
         }
@@ -635,8 +646,14 @@ impl Renderer {
 
     /// 同时调整按 layer 的双阈值 bypass 条件。
     pub fn set_layer_bypass_thresholds(&mut self, entry_threshold: usize, work_threshold: usize) {
-        let entry_threshold = entry_threshold.clamp(MIN_LAYER_BYPASS_ENTRY_THRESHOLD, MAX_LAYER_BYPASS_ENTRY_THRESHOLD);
-        let work_threshold = work_threshold.clamp(MIN_LAYER_BYPASS_WORK_THRESHOLD, MAX_LAYER_BYPASS_WORK_THRESHOLD);
+        let entry_threshold = entry_threshold.clamp(
+            MIN_LAYER_BYPASS_ENTRY_THRESHOLD,
+            MAX_LAYER_BYPASS_ENTRY_THRESHOLD,
+        );
+        let work_threshold = work_threshold.clamp(
+            MIN_LAYER_BYPASS_WORK_THRESHOLD,
+            MAX_LAYER_BYPASS_WORK_THRESHOLD,
+        );
         if self.layer_bypass_entry_threshold == entry_threshold
             && self.layer_bypass_work_threshold == work_threshold
         {
@@ -679,7 +696,39 @@ impl Renderer {
             .retain(|layer, _| self.scene.layer_ids().contains(layer));
         self.shape_query_stats = CachedShapeQueryStats::default();
         self.invalidate_progressive_state(true);
-        self.debug_stats = RenderDebugStats::new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, self.tile_cache_capacity, 0, self.total_cache_evictions, 0, 0, 0, 0, self.progressive_build_budget, self.total_stale_drops, None, 0, 0, None, false, self.layer_bypass_entry_threshold, self.layer_bypass_work_threshold, false, self.hatch_params.spacing, self.hatch_params.width);
+        self.debug_stats = RenderDebugStats::new(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            self.tile_cache_capacity,
+            0,
+            self.total_cache_evictions,
+            0,
+            0,
+            0,
+            0,
+            self.progressive_build_budget,
+            self.total_stale_drops,
+            None,
+            0,
+            0,
+            None,
+            false,
+            self.layer_bypass_entry_threshold,
+            self.layer_bypass_work_threshold,
+            false,
+            self.hatch_params.spacing,
+            self.hatch_params.width,
+        );
     }
 
     /// 当 scene 或 tile grid 变化时，预先把超大 shape 切成按 tile 组织的世界坐标碎片。
@@ -900,456 +949,513 @@ impl Renderer {
         Ok(())
     }
 
+    /// 更新当前视口对应的 scene cache / tile cache / 调试统计。
+    fn update_scene_cache(
+        &mut self,
+        camera: &Camera2D,
+        hidden_layers: &BTreeSet<LayerId>,
+        canvas_origin: Vec2,
+        canvas_size: Vec2,
+        viewport_size: Vec2,
+        draw_mode: ClosedShapeDrawMode,
+        hatch_params: HatchParams,
+        hatch_style: HatchStylePreset,
+        interaction_degraded: bool,
+    ) {
+        let _ = interaction_degraded;
+        let effective_layer_draw_modes = self.layer_draw_modes.clone();
+        let effective_draw_mode = draw_mode;
+        let previous_visible_tile_keys = self.visible_tile_keys.clone();
+        let previous_requested_tile_keys = self.requested_tile_keys.clone();
 
-/// 更新当前视口对应的 scene cache / tile cache / 调试统计。
-fn update_scene_cache(
-    &mut self,
-    camera: &Camera2D,
-    hidden_layers: &BTreeSet<LayerId>,
-    canvas_origin: Vec2,
-    canvas_size: Vec2,
-    viewport_size: Vec2,
-    draw_mode: ClosedShapeDrawMode,
-    hatch_params: HatchParams,
-    hatch_style: HatchStylePreset,
-    interaction_degraded: bool,
-) {
-    let _ = interaction_degraded;
-    let effective_layer_draw_modes = self.layer_draw_modes.clone();
-    let effective_draw_mode = draw_mode;
-
-    let key = build_render_cache_key_with_hatch_styles(
-        self.scene_revision,
-        camera,
-        hidden_layers,
-        &effective_layer_draw_modes,
-        &self.layer_hatch_styles,
-        canvas_origin,
-        canvas_size,
-        viewport_size,
-        effective_draw_mode,
-        hatch_params,
-        hatch_style,
-    );
-
-    let domain = TileCacheDomainKey {
-        scene_revision: self.scene_revision,
-        zoom_bits: camera.zoom().to_bits(),
-        hatch_signature: build_hatch_signature(hatch_params),
-        hatch_style_signature: build_hatch_style_signature(hatch_style)
-            ^ layer_hatch_style_hash_value(&self.layer_hatch_styles),
-    };
-    if self.tile_cache_domain != Some(domain) {
-        self.tile_vertex_cache.clear();
-        self.tile_cache_domain = Some(domain);
-    }
-
-    let mut dropped_this_frame = 0usize;
-    if self.cached_scene_key != Some(key) {
-        self.view_revision = self.view_revision.wrapping_add(1);
-        self.requested_tile_keys.clear();
-        self.visible_tile_keys.clear();
-
-        let visible_world = camera_visible_world_bounds(camera, viewport_size);
-        let visible_world_center = Vec2::new(
-            (visible_world.min_x + visible_world.max_x) * 0.5,
-            (visible_world.min_y + visible_world.max_y) * 0.5,
+        let key = build_render_cache_key_with_hatch_styles(
+            self.scene_revision,
+            camera,
+            hidden_layers,
+            &effective_layer_draw_modes,
+            &self.layer_hatch_styles,
+            canvas_origin,
+            canvas_size,
+            viewport_size,
+            effective_draw_mode,
+            hatch_params,
+            hatch_style,
         );
-        let shape_query = query_visible_shapes(&self.scene, &self.spatial_index, visible_world);
-        let visible_tiles = query_visible_tiles(&self.tile_grid, visible_world);
-        self.shape_query_stats = CachedShapeQueryStats {
-            candidate_shapes: shape_query.stats.candidate_shapes,
-            visible_shapes: shape_query.stats.visible_shapes,
-            bucket_hits: shape_query.stats.bucket_hits,
-            visible_tiles: visible_tiles.len(),
-        };
 
-        let mut keys_by_layer: BTreeMap<LayerId, Vec<TileCacheKey>> = BTreeMap::new();
-        for tile_id in visible_tiles.iter().copied() {
-            let mut tile_layers: BTreeSet<LayerId> = self
-                .tile_grid
-                .layers_for_tile(tile_id)
-                .iter()
-                .copied()
-                .filter(|layer| !hidden_layers.contains(layer))
-                .filter(|layer| {
-                    self.tile_grid
-                        .shape_indices_for_tile_layer(tile_id, *layer)
-                        .iter()
-                        .any(|shape_index| !self.prepared_tile_fragments.shape_indices.contains(shape_index))
-                })
-                .collect();
-            tile_layers.extend(
-                self.prepared_tile_fragments
+        let domain = TileCacheDomainKey {
+            scene_revision: self.scene_revision,
+            zoom_bits: camera.zoom().to_bits(),
+            hatch_signature: build_hatch_signature(hatch_params),
+            hatch_style_signature: build_hatch_style_signature(hatch_style)
+                ^ layer_hatch_style_hash_value(&self.layer_hatch_styles),
+        };
+        if self.tile_cache_domain != Some(domain) {
+            self.tile_vertex_cache.clear();
+            self.tile_cache_domain = Some(domain);
+        }
+
+        let mut dropped_this_frame = 0usize;
+        let mut stable_overlap_keys = HashSet::new();
+        if self.cached_scene_key != Some(key) {
+            let can_incrementally_refresh_tiles = self
+                .cached_scene_key
+                .map(|previous| previous.differs_only_by_pan(key))
+                .unwrap_or(false);
+
+            let visible_world = camera_visible_world_bounds(camera, viewport_size);
+            let visible_world_center = Vec2::new(
+                (visible_world.min_x + visible_world.max_x) * 0.5,
+                (visible_world.min_y + visible_world.max_y) * 0.5,
+            );
+            let shape_query = query_visible_shapes(&self.scene, &self.spatial_index, visible_world);
+            let visible_tiles = query_visible_tiles(&self.tile_grid, visible_world);
+            self.shape_query_stats = CachedShapeQueryStats {
+                candidate_shapes: shape_query.stats.candidate_shapes,
+                visible_shapes: shape_query.stats.visible_shapes,
+                bucket_hits: shape_query.stats.bucket_hits,
+                visible_tiles: visible_tiles.len(),
+            };
+
+            let mut keys_by_layer: BTreeMap<LayerId, Vec<TileCacheKey>> = BTreeMap::new();
+            for tile_id in visible_tiles.iter().copied() {
+                let mut tile_layers: BTreeSet<LayerId> = self
+                    .tile_grid
                     .layers_for_tile(tile_id)
                     .iter()
                     .copied()
-                    .filter(|layer| !hidden_layers.contains(layer)),
-            );
+                    .filter(|layer| !hidden_layers.contains(layer))
+                    .filter(|layer| {
+                        self.tile_grid
+                            .shape_indices_for_tile_layer(tile_id, *layer)
+                            .iter()
+                            .any(|shape_index| {
+                                !self
+                                    .prepared_tile_fragments
+                                    .shape_indices
+                                    .contains(shape_index)
+                            })
+                    })
+                    .collect();
+                tile_layers.extend(
+                    self.prepared_tile_fragments
+                        .layers_for_tile(tile_id)
+                        .iter()
+                        .copied()
+                        .filter(|layer| !hidden_layers.contains(layer)),
+                );
 
-            for layer in tile_layers {
-                let effective_mode = effective_layer_draw_modes
-                    .get(&layer)
-                    .copied()
-                    .unwrap_or(effective_draw_mode);
-                let effective_hatch_style = self
-                    .layer_hatch_styles
-                    .get(&layer)
-                    .copied()
-                    .unwrap_or(hatch_style);
-                keys_by_layer.entry(layer).or_default().push(TileCacheKey {
-                    scene_revision: self.scene_revision,
-                    zoom_bits: camera.zoom().to_bits(),
-                    tile_id,
-                    layer,
-                    effective_mode_tag: effective_mode.as_tag(),
-                    hatch_signature: build_hatch_signature(hatch_params),
-                    effective_hatch_style_tag: effective_hatch_style.as_tag(),
-                });
+                for layer in tile_layers {
+                    let effective_mode = effective_layer_draw_modes
+                        .get(&layer)
+                        .copied()
+                        .unwrap_or(effective_draw_mode);
+                    let effective_hatch_style = self
+                        .layer_hatch_styles
+                        .get(&layer)
+                        .copied()
+                        .unwrap_or(hatch_style);
+                    keys_by_layer.entry(layer).or_default().push(TileCacheKey {
+                        scene_revision: self.scene_revision,
+                        zoom_bits: camera.zoom().to_bits(),
+                        tile_id,
+                        layer,
+                        effective_mode_tag: effective_mode.as_tag(),
+                        hatch_signature: build_hatch_signature(hatch_params),
+                        effective_hatch_style_tag: effective_hatch_style.as_tag(),
+                    });
+                }
             }
+            let next_requested_tile_keys = flatten_layer_major_requested_tile_keys(
+                keys_by_layer,
+                &self.scene.layer_ids(),
+                &self.tile_grid,
+                visible_world_center,
+            );
+            if can_incrementally_refresh_tiles {
+                let previous_requested_set: HashSet<_> =
+                    previous_requested_tile_keys.iter().copied().collect();
+                stable_overlap_keys.extend(
+                    next_requested_tile_keys
+                        .iter()
+                        .copied()
+                        .filter(|tile_key| previous_requested_set.contains(tile_key)),
+                );
+            }
+            self.requested_tile_keys = if can_incrementally_refresh_tiles {
+                merge_requested_tile_keys_for_incremental_pan(
+                    &previous_requested_tile_keys,
+                    next_requested_tile_keys,
+                )
+            } else {
+                next_requested_tile_keys
+            };
+            let cached_tile_keys: HashSet<_> = self.tile_vertex_cache.keys().copied().collect();
+            let (pending, dropped) = if can_incrementally_refresh_tiles {
+                refresh_progressive_queue_incremental(
+                    self.view_revision,
+                    std::mem::take(&mut self.pending_tile_builds),
+                    &self.requested_tile_keys,
+                    &cached_tile_keys,
+                )
+            } else {
+                self.view_revision = self.view_revision.wrapping_add(1);
+                self.active_progressive_layer = None;
+                self.active_display_layer = None;
+                self.active_display_budget = 0;
+                refresh_progressive_queue(
+                    self.view_revision,
+                    std::mem::take(&mut self.pending_tile_builds),
+                    &self.requested_tile_keys,
+                    &cached_tile_keys,
+                )
+            };
+            dropped_this_frame = dropped;
+            self.total_stale_drops += dropped;
+            self.pending_tile_builds = pending;
+            self.cached_scene_key = Some(key);
         }
-        self.requested_tile_keys = flatten_layer_major_requested_tile_keys(
-            keys_by_layer,
-            &self.scene.layer_ids(),
-            &self.tile_grid,
-            visible_world_center,
-        );
-        let (pending, dropped) = refresh_progressive_queue(
-            self.view_revision,
-            std::mem::take(&mut self.pending_tile_builds),
-            &self.requested_tile_keys,
-        );
-        dropped_this_frame = dropped;
-        self.total_stale_drops += dropped;
-        self.pending_tile_builds = pending;
-        self.active_progressive_layer = None;
-        self.active_display_layer = None;
-        self.active_display_budget = 0;
-        self.cached_scene_key = Some(key);
-    }
 
-    let active_layer = next_active_progressive_layer(
-        self.active_progressive_layer,
-        &self.pending_tile_builds,
-    );
-    let active_layer_stats = active_layer
-        .map(|layer| estimate_active_layer_pending_stats(
-            layer,
+        let active_layer =
+            next_active_progressive_layer(self.active_progressive_layer, &self.pending_tile_builds);
+        let active_layer_stats = active_layer
+            .map(|layer| {
+                estimate_active_layer_pending_stats(
+                    layer,
+                    &self.pending_tile_builds,
+                    &self.prepared_tile_fragments,
+                    &self.tile_grid,
+                )
+            })
+            .unwrap_or_default();
+        let layer_bypass = LayerAdaptiveBypassConfig {
+            entry_threshold: self.layer_bypass_entry_threshold,
+            work_threshold: self.layer_bypass_work_threshold,
+        };
+        let (global_build_budget, progressive_bypassed) = compute_effective_build_budget(
+            self.pending_tile_builds.len(),
+            self.progressive_build_budget,
+            self.progressive_bypass_threshold,
+        );
+        let effective_build_budget = if progressive_bypassed {
+            global_build_budget
+        } else {
+            effective_build_budget_for_active_layer(
+                self.pending_tile_builds.len(),
+                active_layer,
+                active_layer_stats,
+                self.progressive_build_budget,
+                layer_bypass,
+            )
+        };
+        self.process_pending_tile_builds(
+            camera.zoom(),
+            effective_draw_mode,
+            &effective_layer_draw_modes,
+            hatch_style,
+            effective_build_budget,
+        );
+
+        let displayed_active_layer =
+            next_active_progressive_layer(self.active_progressive_layer, &self.pending_tile_builds);
+        let displayed_active_layer_stats = estimate_active_layer_pending_stats_for_option(
+            displayed_active_layer,
             &self.pending_tile_builds,
             &self.prepared_tile_fragments,
             &self.tile_grid,
-        ))
-        .unwrap_or_default();
-    let layer_bypass = LayerAdaptiveBypassConfig {
-        entry_threshold: self.layer_bypass_entry_threshold,
-        work_threshold: self.layer_bypass_work_threshold,
-    };
-    let (global_build_budget, progressive_bypassed) = compute_effective_build_budget(
-        self.pending_tile_builds.len(),
-        self.progressive_build_budget,
-        self.progressive_bypass_threshold,
-    );
-    let effective_build_budget = if progressive_bypassed {
-        global_build_budget
-    } else {
-        effective_build_budget_for_active_layer(
-            self.pending_tile_builds.len(),
-            active_layer,
-            active_layer_stats,
-            self.progressive_build_budget,
-            layer_bypass,
-        )
-    };
-    self.process_pending_tile_builds(
-        camera.zoom(),
-        effective_draw_mode,
-        &effective_layer_draw_modes,
-        hatch_style,
-        effective_build_budget,
-    );
-
-    let displayed_active_layer = next_active_progressive_layer(
-        self.active_progressive_layer,
-        &self.pending_tile_builds,
-    );
-    let displayed_active_layer_stats = estimate_active_layer_pending_stats_for_option(
-        displayed_active_layer,
-        &self.pending_tile_builds,
-        &self.prepared_tile_fragments,
-        &self.tile_grid,
-    );
-    let displayed_active_layer_progress_mode = displayed_active_layer.map(|_| {
-        if progressive_bypassed
-            || should_bypass_progressive_for_layer(displayed_active_layer_stats, layer_bypass)
-        {
-            ActiveLayerProgressMode::Bypassed
-        } else {
-            ActiveLayerProgressMode::Progressive
-        }
-    });
-    advance_active_display_budget(
-        &mut self.active_display_layer,
-        &mut self.active_display_budget,
-        displayed_active_layer,
-        progressive_bypassed,
-        displayed_active_layer_progress_mode,
-        effective_build_budget,
-    );
-    let revealed_layers = if progressive_bypassed {
-        requested_layers_in_order(&self.requested_tile_keys)
-            .into_iter()
-            .collect()
-    } else {
-        compute_revealed_layers_for_display(
-            &self.requested_tile_keys,
-            &self.pending_tile_builds,
+        );
+        let displayed_active_layer_progress_mode = displayed_active_layer.map(|_| {
+            if progressive_bypassed
+                || should_bypass_progressive_for_layer(displayed_active_layer_stats, layer_bypass)
+            {
+                ActiveLayerProgressMode::Bypassed
+            } else {
+                ActiveLayerProgressMode::Progressive
+            }
+        });
+        advance_active_display_budget(
+            &mut self.active_display_layer,
+            &mut self.active_display_budget,
             displayed_active_layer,
-        )
-    };
-
-    let mut tile_cache_hits = 0usize;
-    let mut tile_cache_misses = 0usize;
-    let mut layer_cache_hits = 0usize;
-    let mut layer_cache_misses = 0usize;
-    let mut total_vertices = 0usize;
-    let mut visible_tile_keys = Vec::new();
-    let mut tile_state: HashMap<TileId, (bool, bool)> = HashMap::new();
-    let mut active_layer_visible_count = 0usize;
-    let mut active_layer_cached_count = 0usize;
-
-    for tile_key in self.requested_tile_keys.clone() {
-        let state = tile_state.entry(tile_key.tile_id).or_insert((false, false));
-        if let Some(entry) = self.tile_vertex_cache.get(&tile_key) {
-            state.0 = true;
-            layer_cache_hits += 1;
-            let allow_layer = if progressive_bypassed {
-                true
-            } else if Some(tile_key.layer) == displayed_active_layer {
-                active_layer_cached_count += 1;
-                if self.active_display_budget == usize::MAX {
-                    true
-                } else {
-                    active_layer_visible_count < self.active_display_budget
-                }
-            } else {
-                revealed_layers.contains(&tile_key.layer)
-            };
-            if allow_layer {
-                if Some(tile_key.layer) == displayed_active_layer {
-                    active_layer_visible_count += 1;
-                }
-                total_vertices += entry.vertex_count as usize;
-                visible_tile_keys.push(tile_key);
-            }
+            progressive_bypassed,
+            displayed_active_layer_progress_mode,
+            effective_build_budget,
+        );
+        let revealed_layers = if progressive_bypassed {
+            requested_layers_in_order(&self.requested_tile_keys)
+                .into_iter()
+                .collect()
         } else {
-            state.1 = true;
-            layer_cache_misses += 1;
-            self.enqueue_pending_tile_build(tile_key);
+            compute_revealed_layers_for_display(
+                &self.requested_tile_keys,
+                &self.pending_tile_builds,
+                displayed_active_layer,
+            )
+        };
+
+        let mut tile_cache_hits = 0usize;
+        let mut tile_cache_misses = 0usize;
+        let mut layer_cache_hits = 0usize;
+        let mut layer_cache_misses = 0usize;
+        let mut total_vertices = 0usize;
+        let mut visible_tile_keys = Vec::new();
+        let mut tile_state: HashMap<TileId, (bool, bool)> = HashMap::new();
+        let mut active_layer_visible_count = 0usize;
+        let mut active_layer_cached_count = 0usize;
+
+        for tile_key in self.requested_tile_keys.clone() {
+            let state = tile_state.entry(tile_key.tile_id).or_insert((false, false));
+            if let Some(entry) = self.tile_vertex_cache.get(&tile_key) {
+                state.0 = true;
+                layer_cache_hits += 1;
+                let counts_towards_active_budget = Some(tile_key.layer) == displayed_active_layer
+                    && !progressive_bypassed
+                    && !stable_overlap_keys.contains(&tile_key);
+                if counts_towards_active_budget {
+                    active_layer_cached_count += 1;
+                }
+                let allow_layer = should_display_cached_tile_key(
+                    tile_key,
+                    &stable_overlap_keys,
+                    progressive_bypassed,
+                    displayed_active_layer,
+                    self.active_display_budget,
+                    active_layer_visible_count,
+                    &revealed_layers,
+                );
+                if allow_layer {
+                    if counts_towards_active_budget {
+                        active_layer_visible_count += 1;
+                    }
+                    total_vertices += entry.vertex_count as usize;
+                    visible_tile_keys.push(tile_key);
+                }
+            } else {
+                state.1 = true;
+                layer_cache_misses += 1;
+                self.enqueue_pending_tile_build(tile_key);
+            }
+        }
+
+        for (_, (had_hit, had_miss)) in tile_state {
+            if had_hit || had_miss {
+                if had_miss {
+                    tile_cache_misses += 1;
+                } else {
+                    tile_cache_hits += 1;
+                }
+            }
+        }
+
+        let protected_tiles: HashSet<_> = visible_tile_keys.iter().copied().collect();
+        let evicted = prune_tile_cache(
+            &mut self.tile_vertex_cache,
+            self.tile_cache_capacity,
+            tile_cache_byte_budget(self.tile_cache_capacity),
+            &protected_tiles,
+        );
+        self.total_cache_evictions += evicted;
+
+        let cache_bytes: usize = self
+            .tile_vertex_cache
+            .values()
+            .map(|entry| entry.byte_size)
+            .sum::<usize>();
+
+        self.visible_tile_keys = stabilize_visible_tile_keys_during_transition(
+            visible_tile_keys,
+            &previous_visible_tile_keys,
+            self.pending_tile_builds.len(),
+        );
+        self.debug_stats = RenderDebugStats::new(
+            self.scene.shapes().len(),
+            self.shape_query_stats.candidate_shapes,
+            self.shape_query_stats.visible_shapes,
+            self.shape_query_stats.bucket_hits,
+            total_vertices,
+            self.visible_tile_keys.len(),
+            self.shape_query_stats.visible_tiles,
+            tile_cache_hits,
+            tile_cache_misses,
+            layer_cache_hits,
+            layer_cache_misses,
+            self.tile_vertex_cache.len(),
+            self.tile_cache_capacity,
+            cache_bytes,
+            self.total_cache_evictions,
+            self.prepared_tile_fragments.prepared_shape_count(),
+            self.prepared_tile_fragments.prepared_tile_count(),
+            self.prepared_tile_fragments.prepared_fragment_count(),
+            self.pending_tile_builds.len()
+                + active_layer_cached_count.saturating_sub(active_layer_visible_count),
+            effective_build_budget,
+            self.total_stale_drops,
+            displayed_active_layer,
+            active_layer_pending_count(displayed_active_layer, &self.pending_tile_builds),
+            displayed_active_layer_stats.estimated_work_units,
+            displayed_active_layer_progress_mode,
+            progressive_bypassed,
+            self.layer_bypass_entry_threshold,
+            self.layer_bypass_work_threshold,
+            false,
+            self.hatch_params.spacing,
+            self.hatch_params.width,
+        );
+        // 视图 key 没变但还有待构建队列时，说明这一帧命中了“渐进补全”路径。
+        // 这里故意把 `cache_hit` 定义成“这一帧完全没有额外准备工作”，
+        // 这样 UI 上更容易一眼看出 viewer 是否已经稳定下来。
+        self.debug_stats.cache_hit = self.cached_scene_key == Some(key)
+            && self.pending_tile_builds.is_empty()
+            && layer_cache_misses == 0
+            && dropped_this_frame == 0;
+    }
+
+    /// 清理与当前视图相关的一切渐进式状态。
+    fn invalidate_progressive_state(&mut self, clear_gpu_cache: bool) {
+        self.cached_scene_key = None;
+        self.requested_tile_keys.clear();
+        self.visible_tile_keys.clear();
+        self.pending_tile_builds.clear();
+        self.active_progressive_layer = None;
+        self.shape_query_stats = CachedShapeQueryStats::default();
+        self.view_revision = self.view_revision.wrapping_add(1);
+        if clear_gpu_cache {
+            self.tile_cache_domain = None;
+            self.tile_vertex_cache.clear();
         }
     }
 
-    for (_, (had_hit, had_miss)) in tile_state {
-        if had_hit || had_miss {
-            if had_miss {
-                tile_cache_misses += 1;
-            } else {
-                tile_cache_hits += 1;
+    /// 把当前视图仍然缺失的 `tile + layer` 键放进待构建队列。
+    fn enqueue_pending_tile_build(&mut self, tile_key: TileCacheKey) {
+        if self.tile_vertex_cache.contains_key(&tile_key)
+            || self
+                .pending_tile_builds
+                .iter()
+                .any(|pending| pending.tile_key == tile_key)
+        {
+            return;
+        }
+        self.pending_tile_builds = enqueue_unique_pending(
+            std::mem::take(&mut self.pending_tile_builds),
+            PendingTileBuild {
+                view_revision: self.view_revision,
+                tile_key,
+            },
+        );
+    }
+
+    /// 每帧只消化固定预算的 pending 条目。
+    ///
+    /// 这里采用“layer-complete-first”策略：
+    /// 当前活动 layer 没补满之前，不切到下一 layer。
+    fn process_pending_tile_builds(
+        &mut self,
+        zoom: f32,
+        draw_mode: ClosedShapeDrawMode,
+        layer_draw_modes: &BTreeMap<LayerId, ClosedShapeDrawMode>,
+        hatch_style: HatchStylePreset,
+        build_budget: usize,
+    ) {
+        self.cache_access_tick = self.cache_access_tick.wrapping_add(1);
+        let current_tick = self.cache_access_tick;
+        let mut built = 0usize;
+
+        while built < build_budget {
+            let Some(active_layer) = next_active_progressive_layer(
+                self.active_progressive_layer,
+                &self.pending_tile_builds,
+            ) else {
+                self.active_progressive_layer = None;
+                break;
+            };
+            self.active_progressive_layer = Some(active_layer);
+
+            let Some(pending) =
+                pop_next_pending_for_layer(&mut self.pending_tile_builds, active_layer)
+            else {
+                self.active_progressive_layer = None;
+                break;
+            };
+            if pending.view_revision != self.view_revision {
+                self.total_stale_drops += 1;
+                continue;
+            }
+            if self.tile_vertex_cache.contains_key(&pending.tile_key) {
+                continue;
+            }
+            if let Some(entry) = self.build_tile_cache_entry_for_key(
+                pending.tile_key,
+                zoom,
+                draw_mode,
+                layer_draw_modes,
+                hatch_style,
+                current_tick,
+            ) {
+                self.tile_vertex_cache.insert(pending.tile_key, entry);
+            }
+            built += 1;
+
+            if !self
+                .pending_tile_builds
+                .iter()
+                .any(|item| item.tile_key.layer == active_layer)
+            {
+                self.active_progressive_layer = None;
             }
         }
     }
 
-    let protected_tiles: HashSet<_> = visible_tile_keys.iter().copied().collect();
-    let evicted = prune_tile_cache(
-        &mut self.tile_vertex_cache,
-        self.tile_cache_capacity,
-        &protected_tiles,
-    );
-    self.total_cache_evictions += evicted;
-
-    let cache_bytes: usize = self
-        .tile_vertex_cache
-        .values()
-        .map(|entry| entry.byte_size)
-        .sum::<usize>();
-
-    self.visible_tile_keys = visible_tile_keys;
-    self.debug_stats = RenderDebugStats::new(
-        self.scene.shapes().len(),
-        self.shape_query_stats.candidate_shapes,
-        self.shape_query_stats.visible_shapes,
-        self.shape_query_stats.bucket_hits,
-        total_vertices,
-        self.visible_tile_keys.len(),
-        self.shape_query_stats.visible_tiles,
-        tile_cache_hits,
-        tile_cache_misses,
-        layer_cache_hits,
-        layer_cache_misses,
-        self.tile_vertex_cache.len(),
-        self.tile_cache_capacity,
-        cache_bytes,
-        self.total_cache_evictions,
-        self.prepared_tile_fragments.prepared_shape_count(),
-        self.prepared_tile_fragments.prepared_tile_count(),
-        self.prepared_tile_fragments.prepared_fragment_count(),
-        self.pending_tile_builds.len()
-            + active_layer_cached_count.saturating_sub(active_layer_visible_count),
-        effective_build_budget,
-        self.total_stale_drops,
-        displayed_active_layer,
-        active_layer_pending_count(displayed_active_layer, &self.pending_tile_builds),
-        displayed_active_layer_stats.estimated_work_units,
-        displayed_active_layer_progress_mode,
-        progressive_bypassed,
-        self.layer_bypass_entry_threshold,
-        self.layer_bypass_work_threshold,
-        false,
-        self.hatch_params.spacing,
-        self.hatch_params.width,
-    );
-    // 视图 key 没变但还有待构建队列时，说明这一帧命中了“渐进补全”路径。
-    // 这里故意把 `cache_hit` 定义成“这一帧完全没有额外准备工作”，
-    // 这样 UI 上更容易一眼看出 viewer 是否已经稳定下来。
-    self.debug_stats.cache_hit = self.cached_scene_key == Some(key)
-        && self.pending_tile_builds.is_empty()
-        && layer_cache_misses == 0
-        && dropped_this_frame == 0;
-}
-
-/// 清理与当前视图相关的一切渐进式状态。
-fn invalidate_progressive_state(&mut self, clear_gpu_cache: bool) {
-    self.cached_scene_key = None;
-    self.requested_tile_keys.clear();
-    self.visible_tile_keys.clear();
-    self.pending_tile_builds.clear();
-    self.active_progressive_layer = None;
-    self.shape_query_stats = CachedShapeQueryStats::default();
-    self.view_revision = self.view_revision.wrapping_add(1);
-    if clear_gpu_cache {
-        self.tile_cache_domain = None;
-        self.tile_vertex_cache.clear();
-    }
-}
-
-/// 把当前视图仍然缺失的 `tile + layer` 键放进待构建队列。
-fn enqueue_pending_tile_build(&mut self, tile_key: TileCacheKey) {
-    if self.tile_vertex_cache.contains_key(&tile_key)
-        || self
-            .pending_tile_builds
+    /// 为一个指定的 `tile + layer` 生成 GPU 顶点缓存条目。
+    fn build_tile_cache_entry_for_key(
+        &self,
+        tile_key: TileCacheKey,
+        zoom: f32,
+        draw_mode: ClosedShapeDrawMode,
+        layer_draw_modes: &BTreeMap<LayerId, ClosedShapeDrawMode>,
+        hatch_style: HatchStylePreset,
+        current_tick: u64,
+    ) -> Option<TileCacheEntry> {
+        let shape_indices: Vec<_> = self
+            .tile_grid
+            .shape_indices_for_tile_layer(tile_key.tile_id, tile_key.layer)
             .iter()
-            .any(|pending| pending.tile_key == tile_key)
-    {
-        return;
-    }
-    self.pending_tile_builds = enqueue_unique_pending(
-        std::mem::take(&mut self.pending_tile_builds),
-        PendingTileBuild {
-            view_revision: self.view_revision,
-            tile_key,
-        },
-    );
-}
-
-/// 每帧只消化固定预算的 pending 条目。
-///
-/// 这里采用“layer-complete-first”策略：
-/// 当前活动 layer 没补满之前，不切到下一 layer。
-fn process_pending_tile_builds(
-    &mut self,
-    zoom: f32,
-    draw_mode: ClosedShapeDrawMode,
-    layer_draw_modes: &BTreeMap<LayerId, ClosedShapeDrawMode>,
-    hatch_style: HatchStylePreset,
-    build_budget: usize,
-) {
-    self.cache_access_tick = self.cache_access_tick.wrapping_add(1);
-    let current_tick = self.cache_access_tick;
-    let mut built = 0usize;
-
-    while built < build_budget {
-        let Some(active_layer) = next_active_progressive_layer(
-            self.active_progressive_layer,
-            &self.pending_tile_builds,
-        ) else {
-            self.active_progressive_layer = None;
-            break;
-        };
-        self.active_progressive_layer = Some(active_layer);
-
-        let Some(pending) = pop_next_pending_for_layer(&mut self.pending_tile_builds, active_layer) else {
-            self.active_progressive_layer = None;
-            break;
-        };
-        if pending.view_revision != self.view_revision {
-            self.total_stale_drops += 1;
-            continue;
-        }
-        if self.tile_vertex_cache.contains_key(&pending.tile_key) {
-            continue;
-        }
-        if let Some(entry) = self.build_tile_cache_entry_for_key(
-            pending.tile_key,
-            zoom,
-            draw_mode,
-            layer_draw_modes,
-            hatch_style,
-            current_tick,
-        ) {
-            self.tile_vertex_cache.insert(pending.tile_key, entry);
-        }
-        built += 1;
-
-        if !self.pending_tile_builds.iter().any(|item| item.tile_key.layer == active_layer) {
-            self.active_progressive_layer = None;
-        }
-    }
-}
-
-/// 为一个指定的 `tile + layer` 生成 GPU 顶点缓存条目。
-fn build_tile_cache_entry_for_key(
-    &self,
-    tile_key: TileCacheKey,
-    zoom: f32,
-    draw_mode: ClosedShapeDrawMode,
-    layer_draw_modes: &BTreeMap<LayerId, ClosedShapeDrawMode>,
-    hatch_style: HatchStylePreset,
-    current_tick: u64,
-) -> Option<TileCacheEntry> {
-    let shape_indices: Vec<_> = self
-        .tile_grid
-        .shape_indices_for_tile_layer(tile_key.tile_id, tile_key.layer)
-        .iter()
-        .copied()
-        .filter(|shape_index| !self.prepared_tile_fragments.shape_indices.contains(shape_index))
-        .collect();
-    let empty_hidden_layers = BTreeSet::new();
-    let mut vertices = build_scaled_scene_vertices_for_tile(
-        &self.scene,
-        zoom,
-        &empty_hidden_layers,
-        layer_draw_modes,
-        &shape_indices,
-        draw_mode,
-        Some(self.tile_grid.tile_bounds(tile_key.tile_id)),
-        &self.layer_hatch_styles,
-        hatch_style,
-    );
-    if let Some(prepared_fragments) = self
-        .prepared_tile_fragments
-        .fragments_for_tile_layer(tile_key.tile_id, tile_key.layer)
-    {
-        vertices.extend(build_scaled_scene_vertices_for_prepared_fragments_with_hatch_styles(
-            prepared_fragments,
+            .copied()
+            .filter(|shape_index| {
+                !self
+                    .prepared_tile_fragments
+                    .shape_indices
+                    .contains(shape_index)
+            })
+            .collect();
+        let empty_hidden_layers = BTreeSet::new();
+        let mut vertices = build_scaled_scene_vertices_for_tile(
+            &self.scene,
             zoom,
             &empty_hidden_layers,
             layer_draw_modes,
-            &self.layer_hatch_styles,
+            &shape_indices,
             draw_mode,
+            Some(self.tile_grid.tile_bounds(tile_key.tile_id)),
+            &self.layer_hatch_styles,
             hatch_style,
-        ));
+        );
+        if let Some(prepared_fragments) = self
+            .prepared_tile_fragments
+            .fragments_for_tile_layer(tile_key.tile_id, tile_key.layer)
+        {
+            vertices.extend(
+                build_scaled_scene_vertices_for_prepared_fragments_with_hatch_styles(
+                    prepared_fragments,
+                    zoom,
+                    &empty_hidden_layers,
+                    layer_draw_modes,
+                    &self.layer_hatch_styles,
+                    draw_mode,
+                    hatch_style,
+                ),
+            );
+        }
+        create_tile_cache_entry(&self.device, &vertices, current_tick)
     }
-    create_tile_cache_entry(&self.device, &vertices, current_tick)
-}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1378,8 +1484,14 @@ impl ScissorRect {
     fn intersect(self, other: Self) -> Option<Self> {
         let x0 = self.x.max(other.x);
         let y0 = self.y.max(other.y);
-        let x1 = self.x.saturating_add(self.width).min(other.x.saturating_add(other.width));
-        let y1 = self.y.saturating_add(self.height).min(other.y.saturating_add(other.height));
+        let x1 = self
+            .x
+            .saturating_add(self.width)
+            .min(other.x.saturating_add(other.width));
+        let y1 = self
+            .y
+            .saturating_add(self.height)
+            .min(other.y.saturating_add(other.height));
         if x1 > x0 && y1 > y0 {
             Some(Self {
                 x: x0,
@@ -1429,7 +1541,13 @@ fn tile_scissor_rect(
 ) -> Option<ScissorRect> {
     let min = Vec2::new(tile_bounds.min_x, tile_bounds.min_y) * zoom + translation;
     let max = Vec2::new(tile_bounds.max_x, tile_bounds.max_y) * zoom + translation;
-    ScissorRect::from_logical_rect(min, max - min, pixels_per_point, surface_width, surface_height)
+    ScissorRect::from_logical_rect(
+        min,
+        max - min,
+        pixels_per_point,
+        surface_width,
+        surface_height,
+    )
 }
 
 /// 为一个 tile 创建 GPU vertex buffer。
@@ -1454,17 +1572,36 @@ fn should_freeze_interaction_view(interaction_degraded: bool, has_stable_view: b
     interaction_degraded && has_stable_view
 }
 
-
-
 fn enqueue_unique_pending(
     mut pending: VecDeque<PendingTileBuild>,
     new_item: PendingTileBuild,
 ) -> VecDeque<PendingTileBuild> {
-    if pending.iter().any(|item| item.tile_key == new_item.tile_key) {
+    if pending
+        .iter()
+        .any(|item| item.tile_key == new_item.tile_key)
+    {
         return pending;
     }
     pending.push_back(new_item);
     pending
+}
+
+fn stabilize_visible_tile_keys_during_transition(
+    mut current: Vec<TileCacheKey>,
+    previous: &[TileCacheKey],
+    pending_entries: usize,
+) -> Vec<TileCacheKey> {
+    if pending_entries == 0 {
+        return current;
+    }
+
+    let mut seen: HashSet<TileCacheKey> = current.iter().copied().collect();
+    for key in previous {
+        if seen.insert(*key) {
+            current.push(*key);
+        }
+    }
+    current
 }
 
 fn sort_tile_keys_by_world_center(
@@ -1475,11 +1612,19 @@ fn sort_tile_keys_by_world_center(
     keys.sort_by(|a, b| {
         let a_bounds = tile_grid.tile_bounds(a.tile_id);
         let b_bounds = tile_grid.tile_bounds(b.tile_id);
-        let a_center = Vec2::new((a_bounds.min_x + a_bounds.max_x) * 0.5, (a_bounds.min_y + a_bounds.max_y) * 0.5);
-        let b_center = Vec2::new((b_bounds.min_x + b_bounds.max_x) * 0.5, (b_bounds.min_y + b_bounds.max_y) * 0.5);
+        let a_center = Vec2::new(
+            (a_bounds.min_x + a_bounds.max_x) * 0.5,
+            (a_bounds.min_y + a_bounds.max_y) * 0.5,
+        );
+        let b_center = Vec2::new(
+            (b_bounds.min_x + b_bounds.max_x) * 0.5,
+            (b_bounds.min_y + b_bounds.max_y) * 0.5,
+        );
         let a_dist = a_center.distance_squared(center);
         let b_dist = b_center.distance_squared(center);
-        a_dist.partial_cmp(&b_dist).unwrap_or(std::cmp::Ordering::Equal)
+        a_dist
+            .partial_cmp(&b_dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     keys
 }
@@ -1497,15 +1642,46 @@ fn flatten_layer_major_requested_tile_keys(
     // 这样用户最先看到的会是正在关注区域先稳定下来。
     for layer in scene_layers {
         if let Some(keys) = keys_by_layer.remove(layer) {
-            ordered.extend(sort_tile_keys_by_world_center(keys, tile_grid, visible_world_center));
+            ordered.extend(sort_tile_keys_by_world_center(
+                keys,
+                tile_grid,
+                visible_world_center,
+            ));
         }
     }
 
     for (_, keys) in keys_by_layer {
-        ordered.extend(sort_tile_keys_by_world_center(keys, tile_grid, visible_world_center));
+        ordered.extend(sort_tile_keys_by_world_center(
+            keys,
+            tile_grid,
+            visible_world_center,
+        ));
     }
 
     ordered
+}
+
+fn merge_requested_tile_keys_for_incremental_pan(
+    previous_requested: &[TileCacheKey],
+    next_requested: Vec<TileCacheKey>,
+) -> Vec<TileCacheKey> {
+    let next_requested_set: HashSet<_> = next_requested.iter().copied().collect();
+    let mut merged = Vec::with_capacity(next_requested.len());
+    let mut seen = HashSet::new();
+
+    for key in previous_requested {
+        if next_requested_set.contains(key) && seen.insert(*key) {
+            merged.push(*key);
+        }
+    }
+
+    for key in next_requested {
+        if seen.insert(key) {
+            merged.push(key);
+        }
+    }
+
+    merged
 }
 
 fn compute_effective_build_budget(
@@ -1576,7 +1752,10 @@ fn estimate_active_layer_pending_stats(
     tile_grid: &TileGridIndex,
 ) -> LayerPendingStats {
     let mut tile_ids = Vec::new();
-    for item in pending.iter().filter(|item| item.tile_key.layer == active_layer) {
+    for item in pending
+        .iter()
+        .filter(|item| item.tile_key.layer == active_layer)
+    {
         tile_ids.push(item.tile_key.tile_id);
     }
     tile_ids.sort();
@@ -1584,7 +1763,12 @@ fn estimate_active_layer_pending_stats(
 
     let prepared_fragment_count: usize = tile_ids
         .iter()
-        .map(|tile_id| prepared.fragments_for_tile_layer(*tile_id, active_layer).map(|f| f.len()).unwrap_or(0))
+        .map(|tile_id| {
+            prepared
+                .fragments_for_tile_layer(*tile_id, active_layer)
+                .map(|f| f.len())
+                .unwrap_or(0)
+        })
         .sum();
 
     let regular_shape_count: usize = tile_ids
@@ -1598,7 +1782,10 @@ fn estimate_active_layer_pending_stats(
         })
         .sum();
 
-    let pending_entries = pending.iter().filter(|item| item.tile_key.layer == active_layer).count();
+    let pending_entries = pending
+        .iter()
+        .filter(|item| item.tile_key.layer == active_layer)
+        .count();
     let estimated_work_units = pending_entries * LAYER_WORK_ENTRY_WEIGHT
         + prepared_fragment_count * LAYER_WORK_PREPARED_WEIGHT
         + regular_shape_count * LAYER_WORK_REGULAR_WEIGHT;
@@ -1618,7 +1805,10 @@ fn active_layer_pending_count(
     let Some(layer) = active_layer else {
         return 0;
     };
-    pending.iter().filter(|item| item.tile_key.layer == layer).count()
+    pending
+        .iter()
+        .filter(|item| item.tile_key.layer == layer)
+        .count()
 }
 
 fn requested_layers_in_order(requested_keys: &[TileCacheKey]) -> Vec<LayerId> {
@@ -1659,6 +1849,27 @@ fn compute_revealed_layers_for_display(
     }
 
     revealed
+}
+
+fn should_display_cached_tile_key(
+    tile_key: TileCacheKey,
+    stable_overlap_keys: &HashSet<TileCacheKey>,
+    progressive_bypassed: bool,
+    displayed_active_layer: Option<LayerId>,
+    active_display_budget: usize,
+    active_layer_visible_count: usize,
+    revealed_layers: &BTreeSet<LayerId>,
+) -> bool {
+    if progressive_bypassed || stable_overlap_keys.contains(&tile_key) {
+        return true;
+    }
+
+    if Some(tile_key.layer) == displayed_active_layer {
+        return active_display_budget == usize::MAX
+            || active_layer_visible_count < active_display_budget;
+    }
+
+    revealed_layers.contains(&tile_key.layer)
 }
 
 fn advance_active_display_budget(
@@ -1718,7 +1929,9 @@ fn pop_next_pending_for_layer(
     pending: &mut VecDeque<PendingTileBuild>,
     layer: LayerId,
 ) -> Option<PendingTileBuild> {
-    let index = pending.iter().position(|item| item.tile_key.layer == layer)?;
+    let index = pending
+        .iter()
+        .position(|item| item.tile_key.layer == layer)?;
     pending.remove(index)
 }
 
@@ -1726,11 +1939,18 @@ fn refresh_progressive_queue(
     view_revision: u64,
     old_pending: VecDeque<PendingTileBuild>,
     requested_keys: &[TileCacheKey],
+    cached_keys: &HashSet<TileCacheKey>,
 ) -> (VecDeque<PendingTileBuild>, usize) {
-    let dropped = old_pending.len();
+    let previous_keys: HashSet<_> = old_pending.iter().map(|item| item.tile_key).collect();
+    let requested_key_set: HashSet<_> = requested_keys.iter().copied().collect();
+    let dropped = previous_keys
+        .iter()
+        .filter(|tile_key| !requested_key_set.contains(tile_key))
+        .count();
     let pending = requested_keys
         .iter()
         .copied()
+        .filter(|tile_key| !cached_keys.contains(tile_key))
         .map(|tile_key| PendingTileBuild {
             view_revision,
             tile_key,
@@ -1739,9 +1959,47 @@ fn refresh_progressive_queue(
     (pending, dropped)
 }
 
+fn refresh_progressive_queue_incremental(
+    view_revision: u64,
+    old_pending: VecDeque<PendingTileBuild>,
+    requested_keys: &[TileCacheKey],
+    cached_keys: &HashSet<TileCacheKey>,
+) -> (VecDeque<PendingTileBuild>, usize) {
+    let requested_key_set: HashSet<_> = requested_keys.iter().copied().collect();
+    let mut seen = HashSet::new();
+    let mut dropped = 0usize;
+    let mut pending = VecDeque::new();
+
+    for previous in old_pending {
+        if !requested_key_set.contains(&previous.tile_key) {
+            dropped += 1;
+            continue;
+        }
+        if cached_keys.contains(&previous.tile_key) || !seen.insert(previous.tile_key) {
+            continue;
+        }
+        pending.push_back(PendingTileBuild {
+            view_revision,
+            tile_key: previous.tile_key,
+        });
+    }
+
+    for tile_key in requested_keys.iter().copied() {
+        if cached_keys.contains(&tile_key) || !seen.insert(tile_key) {
+            continue;
+        }
+        pending.push_back(PendingTileBuild {
+            view_revision,
+            tile_key,
+        });
+    }
+
+    (pending, dropped)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
     use glam::Vec2;
 
@@ -1750,15 +2008,16 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{
-        active_layer_pending_count, advance_active_display_budget,
+        ActiveLayerProgressMode, LayerAdaptiveBypassConfig, LayerPendingStats, PendingTileBuild,
+        RenderDebugStats, TileCacheKey, active_layer_pending_count, advance_active_display_budget,
         compute_effective_build_budget, compute_revealed_layers_for_display,
         effective_build_budget_for_active_layer, enqueue_unique_pending,
-        next_active_progressive_layer, pop_next_pending_for_layer, refresh_progressive_queue,
-        requested_layers_in_order, select_tile_eviction_victims,
-        should_bypass_progressive_for_layer, should_freeze_interaction_view,
-        tile_scissor_rect, ActiveLayerProgressMode,
-        LayerAdaptiveBypassConfig, LayerPendingStats, PendingTileBuild, RenderDebugStats,
-        TileCacheKey,
+        merge_requested_tile_keys_for_incremental_pan, next_active_progressive_layer,
+        pop_next_pending_for_layer, refresh_progressive_queue,
+        refresh_progressive_queue_incremental, requested_layers_in_order,
+        select_tile_eviction_victims, should_bypass_progressive_for_layer,
+        should_display_cached_tile_key, should_freeze_interaction_view,
+        stabilize_visible_tile_keys_during_transition, tile_scissor_rect,
     };
 
     #[test]
@@ -1767,20 +2026,30 @@ mod tests {
         let a = key(0, 1);
         let b = key(1, 5);
         let c = key(2, 3);
-        usage.insert(a, 1);
-        usage.insert(b, 5);
-        usage.insert(c, 3);
+        usage.insert(a, (1, 10));
+        usage.insert(b, (5, 10));
+        usage.insert(c, (3, 10));
 
         let protected = HashSet::from([b]);
-        let victims = select_tile_eviction_victims(&usage, 2, &protected);
+        let victims = select_tile_eviction_victims(&usage, 2, usize::MAX, &protected);
 
         assert_eq!(victims, vec![a]);
     }
 
     #[test]
     fn disjoint_scissor_intersection_returns_none_without_overflow() {
-        let a = super::ScissorRect { x: 100, y: 100, width: 20, height: 20 };
-        let b = super::ScissorRect { x: 10, y: 10, width: 5, height: 5 };
+        let a = super::ScissorRect {
+            x: 100,
+            y: 100,
+            width: 20,
+            height: 20,
+        };
+        let b = super::ScissorRect {
+            x: 10,
+            y: 10,
+            width: 5,
+            height: 5,
+        };
 
         assert_eq!(a.intersect(b), None);
         assert_eq!(b.intersect(a), None);
@@ -1805,7 +2074,10 @@ mod tests {
             scene_revision: 1,
             zoom_bits: 1.0f32.to_bits(),
             tile_id: tile,
-            layer: LayerId { layer: 1, datatype: 1 },
+            layer: LayerId {
+                layer: 1,
+                datatype: 1,
+            },
             effective_mode_tag: 0,
             hatch_signature: 7,
             effective_hatch_style_tag: 0,
@@ -1814,7 +2086,10 @@ mod tests {
             scene_revision: 1,
             zoom_bits: 1.0f32.to_bits(),
             tile_id: tile,
-            layer: LayerId { layer: 1, datatype: 2 },
+            layer: LayerId {
+                layer: 1,
+                datatype: 2,
+            },
             effective_mode_tag: 0,
             hatch_signature: 7,
             effective_hatch_style_tag: 0,
@@ -1823,7 +2098,10 @@ mod tests {
             scene_revision: 1,
             zoom_bits: 1.0f32.to_bits(),
             tile_id: tile,
-            layer: LayerId { layer: 1, datatype: 1 },
+            layer: LayerId {
+                layer: 1,
+                datatype: 1,
+            },
             effective_mode_tag: 2,
             hatch_signature: 7,
             effective_hatch_style_tag: 0,
@@ -1833,46 +2111,214 @@ mod tests {
         assert_ne!(a, c);
     }
 
-
-#[test]
-fn enqueue_skips_duplicate_tile_keys() {
-    let pending = enqueue_unique_pending(
-        VecDeque::from([
+    #[test]
+    fn enqueue_skips_duplicate_tile_keys() {
+        let pending = enqueue_unique_pending(
+            VecDeque::from([PendingTileBuild {
+                view_revision: 3,
+                tile_key: key(0, 0),
+            }]),
             PendingTileBuild {
                 view_revision: 3,
                 tile_key: key(0, 0),
             },
-        ]),
-        PendingTileBuild {
-            view_revision: 3,
-            tile_key: key(0, 0),
-        },
-    );
+        );
 
-    assert_eq!(pending.len(), 1);
-}
+        assert_eq!(pending.len(), 1);
+    }
 
-#[test]
-fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
-    let old = VecDeque::from([
-        PendingTileBuild {
-            view_revision: 1,
-            tile_key: key(0, 0),
-        },
-        PendingTileBuild {
-            view_revision: 1,
-            tile_key: key(1, 0),
-        },
-    ]);
-    let requested = vec![key(2, 0), key(3, 0)];
-    let (pending, dropped) = refresh_progressive_queue(7, old, &requested);
+    #[test]
+    fn transition_keeps_previous_visible_tiles_while_new_view_is_still_pending() {
+        let previous = vec![key(0, 0), key(1, 0)];
+        let current = vec![key(2, 0)];
 
-    assert_eq!(dropped, 2);
-    assert_eq!(pending.len(), 2);
-    assert!(pending.iter().all(|item| item.view_revision == 7));
-    let cols: Vec<_> = pending.iter().map(|item| item.tile_key.tile_id.col).collect();
-    assert_eq!(cols, vec![2, 3]);
-}
+        let stabilized = stabilize_visible_tile_keys_during_transition(current, &previous, 3);
+
+        assert_eq!(stabilized, vec![key(2, 0), key(0, 0), key(1, 0)]);
+    }
+
+    #[test]
+    fn transition_does_not_keep_previous_tiles_once_view_is_stable() {
+        let previous = vec![key(0, 0), key(1, 0)];
+        let current = vec![key(2, 0)];
+
+        let stabilized = stabilize_visible_tile_keys_during_transition(current, &previous, 0);
+
+        assert_eq!(stabilized, vec![key(2, 0)]);
+    }
+
+    #[test]
+    fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
+        let old = VecDeque::from([
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key(0, 0),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key(1, 0),
+            },
+        ]);
+        let requested = vec![key(2, 0), key(3, 0)];
+        let cached = HashSet::new();
+        let (pending, dropped) = refresh_progressive_queue(7, old, &requested, &cached);
+
+        assert_eq!(dropped, 2);
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|item| item.view_revision == 7));
+        let cols: Vec<_> = pending
+            .iter()
+            .map(|item| item.tile_key.tile_id.col)
+            .collect();
+        assert_eq!(cols, vec![2, 3]);
+    }
+
+    #[test]
+    fn refresh_progressive_queue_preserves_overlap_without_counting_it_as_stale() {
+        let old = VecDeque::from([
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key(0, 0),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key(1, 0),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key(2, 0),
+            },
+        ]);
+        let requested = vec![key(1, 0), key(2, 0), key(3, 0)];
+        let cached = HashSet::new();
+        let (pending, dropped) = refresh_progressive_queue(7, old, &requested, &cached);
+
+        assert_eq!(dropped, 1);
+        assert_eq!(pending.len(), 3);
+        assert!(pending.iter().all(|item| item.view_revision == 7));
+        let cols: Vec<_> = pending
+            .iter()
+            .map(|item| item.tile_key.tile_id.col)
+            .collect();
+        assert_eq!(cols, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn refresh_progressive_queue_skips_already_cached_tiles() {
+        let old = VecDeque::new();
+        let requested = vec![key(1, 0), key(2, 0), key(3, 0)];
+        let cached = HashSet::from([key(2, 0)]);
+
+        let (pending, dropped) = refresh_progressive_queue(7, old, &requested, &cached);
+
+        assert_eq!(dropped, 0);
+        let cols: Vec<_> = pending
+            .iter()
+            .map(|item| item.tile_key.tile_id.col)
+            .collect();
+        assert_eq!(cols, vec![1, 3]);
+    }
+
+    #[test]
+    fn incremental_refresh_keeps_only_uncached_newly_visible_tiles() {
+        let old = VecDeque::from([
+            PendingTileBuild {
+                view_revision: 3,
+                tile_key: key(0, 0),
+            },
+            PendingTileBuild {
+                view_revision: 3,
+                tile_key: key(1, 0),
+            },
+        ]);
+        let requested = vec![key(1, 0), key(2, 0), key(3, 0)];
+        let cached = HashSet::from([key(1, 0), key(2, 0)]);
+
+        let (pending, dropped) = refresh_progressive_queue_incremental(3, old, &requested, &cached);
+
+        assert_eq!(dropped, 1);
+        let cols: Vec<_> = pending
+            .iter()
+            .map(|item| item.tile_key.tile_id.col)
+            .collect();
+        assert_eq!(cols, vec![3]);
+    }
+
+    #[test]
+    fn incremental_pan_keeps_overlap_tile_order_stable() {
+        let previous = vec![key(1, 0), key(2, 0), key(3, 0), key(4, 0)];
+        let next = vec![key(4, 0), key(3, 0), key(2, 0), key(5, 0)];
+
+        let merged = merge_requested_tile_keys_for_incremental_pan(&previous, next);
+        let cols: Vec<_> = merged.iter().map(|item| item.tile_id.col).collect();
+
+        assert_eq!(cols, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn stable_overlap_tile_stays_visible_even_when_later_layers_are_not_revealed() {
+        let active_layer = LayerId {
+            layer: 1,
+            datatype: 0,
+        };
+        let later_layer = LayerId {
+            layer: 2,
+            datatype: 0,
+        };
+        let overlap_key = TileCacheKey {
+            scene_revision: 1,
+            zoom_bits: 1.0f32.to_bits(),
+            tile_id: super::TileId { col: 4, row: 0 },
+            layer: later_layer,
+            effective_mode_tag: 0,
+            hatch_signature: 0,
+            effective_hatch_style_tag: 0,
+        };
+        let revealed_layers = BTreeSet::from([active_layer]);
+        let stable_overlap = HashSet::from([overlap_key]);
+
+        assert!(should_display_cached_tile_key(
+            overlap_key,
+            &stable_overlap,
+            false,
+            Some(active_layer),
+            0,
+            0,
+            &revealed_layers,
+        ));
+    }
+
+    #[test]
+    fn non_overlap_later_layer_tile_stays_hidden_until_revealed() {
+        let active_layer = LayerId {
+            layer: 1,
+            datatype: 0,
+        };
+        let later_layer = LayerId {
+            layer: 2,
+            datatype: 0,
+        };
+        let later_key = TileCacheKey {
+            scene_revision: 1,
+            zoom_bits: 1.0f32.to_bits(),
+            tile_id: super::TileId { col: 5, row: 0 },
+            layer: later_layer,
+            effective_mode_tag: 0,
+            hatch_signature: 0,
+            effective_hatch_style_tag: 0,
+        };
+        let revealed_layers = BTreeSet::from([active_layer]);
+
+        assert!(!should_display_cached_tile_key(
+            later_key,
+            &HashSet::new(),
+            false,
+            Some(active_layer),
+            0,
+            0,
+            &revealed_layers,
+        ));
+    }
 
     #[test]
     fn small_pending_sets_bypass_progressive_mode() {
@@ -1890,7 +2336,10 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
 
     #[test]
     fn active_display_budget_grows_progressively_for_same_layer() {
-        let layer = LayerId { layer: 5, datatype: 0 };
+        let layer = LayerId {
+            layer: 5,
+            datatype: 0,
+        };
         let mut active_display_layer = None;
         let mut active_display_budget = 0usize;
 
@@ -1917,7 +2366,10 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
 
     #[test]
     fn bypassed_active_display_layer_reveals_all_entries_immediately() {
-        let layer = LayerId { layer: 5, datatype: 0 };
+        let layer = LayerId {
+            layer: 5,
+            datatype: 0,
+        };
         let mut active_display_layer = None;
         let mut active_display_budget = 0usize;
 
@@ -1936,9 +2388,18 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
 
     #[test]
     fn display_gate_reveals_only_completed_prefix_and_active_layer() {
-        let layer_a = LayerId { layer: 1, datatype: 0 };
-        let layer_b = LayerId { layer: 2, datatype: 0 };
-        let layer_c = LayerId { layer: 3, datatype: 0 };
+        let layer_a = LayerId {
+            layer: 1,
+            datatype: 0,
+        };
+        let layer_b = LayerId {
+            layer: 2,
+            datatype: 0,
+        };
+        let layer_c = LayerId {
+            layer: 3,
+            datatype: 0,
+        };
         let requested = vec![
             key_for_layer(0, layer_a),
             key_for_layer(1, layer_a),
@@ -1947,8 +2408,14 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
             key_for_layer(4, layer_c),
         ];
         let pending = VecDeque::from([
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(2, layer_b) },
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(4, layer_c) },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(2, layer_b),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(4, layer_c),
+            },
         ]);
 
         let revealed = compute_revealed_layers_for_display(&requested, &pending, Some(layer_b));
@@ -1960,8 +2427,14 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
 
     #[test]
     fn requested_layers_keep_layer_major_order_without_duplicates() {
-        let layer_a = LayerId { layer: 1, datatype: 0 };
-        let layer_b = LayerId { layer: 2, datatype: 0 };
+        let layer_a = LayerId {
+            layer: 1,
+            datatype: 0,
+        };
+        let layer_b = LayerId {
+            layer: 2,
+            datatype: 0,
+        };
         let ordered = requested_layers_in_order(&[
             key_for_layer(0, layer_a),
             key_for_layer(1, layer_a),
@@ -1974,33 +2447,65 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
 
     #[test]
     fn next_active_layer_prefers_existing_layer_until_it_is_empty() {
-        let layer_a = LayerId { layer: 1, datatype: 1 };
-        let layer_b = LayerId { layer: 2, datatype: 0 };
+        let layer_a = LayerId {
+            layer: 1,
+            datatype: 1,
+        };
+        let layer_b = LayerId {
+            layer: 2,
+            datatype: 0,
+        };
         let pending = VecDeque::from([
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(0, layer_a) },
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(1, layer_a) },
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(2, layer_b) },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(0, layer_a),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(1, layer_a),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(2, layer_b),
+            },
         ]);
 
         assert_eq!(next_active_progressive_layer(None, &pending), Some(layer_a));
-        assert_eq!(next_active_progressive_layer(Some(layer_a), &pending), Some(layer_a));
+        assert_eq!(
+            next_active_progressive_layer(Some(layer_a), &pending),
+            Some(layer_a)
+        );
     }
 
     #[test]
     fn active_layer_switches_after_previous_layer_finishes() {
-        let layer_a = LayerId { layer: 1, datatype: 1 };
-        let layer_b = LayerId { layer: 2, datatype: 0 };
+        let layer_a = LayerId {
+            layer: 1,
+            datatype: 1,
+        };
+        let layer_b = LayerId {
+            layer: 2,
+            datatype: 0,
+        };
         let mut pending = VecDeque::from([
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(0, layer_a) },
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(1, layer_b) },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(0, layer_a),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(1, layer_b),
+            },
         ]);
 
         let first = pop_next_pending_for_layer(&mut pending, layer_a).expect("first layer item");
         assert_eq!(first.tile_key.layer, layer_a);
-        assert_eq!(next_active_progressive_layer(Some(layer_a), &pending), Some(layer_b));
+        assert_eq!(
+            next_active_progressive_layer(Some(layer_a), &pending),
+            Some(layer_b)
+        );
         assert_eq!(active_layer_pending_count(Some(layer_b), &pending), 1);
     }
-
 
     #[test]
     fn small_active_layer_with_small_work_is_bypassed() {
@@ -2058,11 +2563,23 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
 
     #[test]
     fn active_layer_can_bypass_with_temporary_full_layer_budget() {
-        let layer = LayerId { layer: 10, datatype: 0 };
+        let layer = LayerId {
+            layer: 10,
+            datatype: 0,
+        };
         let pending = VecDeque::from([
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(0, layer) },
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(1, layer) },
-            PendingTileBuild { view_revision: 1, tile_key: key_for_layer(2, layer) },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(0, layer),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(1, layer),
+            },
+            PendingTileBuild {
+                view_revision: 1,
+                tile_key: key_for_layer(2, layer),
+            },
         ]);
 
         let stats = LayerPendingStats {
@@ -2087,10 +2604,47 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
     }
 
     #[test]
+    fn tile_cache_eviction_also_respects_byte_budget() {
+        let protected = std::collections::HashSet::new();
+        let usage = HashMap::from([
+            (key(0, 0), (1_u64, 70_usize)),
+            (key(1, 0), (2_u64, 60_usize)),
+            (key(2, 0), (3_u64, 10_usize)),
+        ]);
+
+        let victims = select_tile_eviction_victims(&usage, 8, 100, &protected);
+
+        assert_eq!(victims, vec![key(0, 0)]);
+    }
+
+    #[test]
     fn render_debug_stats_include_active_layer_bypass_details() {
         let stats = RenderDebugStats::new(
-            9, 3, 2, 1, 24, 2, 2, 1, 1, 4, 2, 12, 64, 768, 3, 2, 5, 9, 6, 16, 2,
-            Some(LayerId { layer: 1, datatype: 0 }),
+            9,
+            3,
+            2,
+            1,
+            24,
+            2,
+            2,
+            1,
+            1,
+            4,
+            2,
+            12,
+            64,
+            768,
+            3,
+            2,
+            5,
+            9,
+            6,
+            16,
+            2,
+            Some(LayerId {
+                layer: 1,
+                datatype: 0,
+            }),
             5,
             32,
             Some(ActiveLayerProgressMode::Bypassed),
@@ -2102,10 +2656,19 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
             1.5,
         );
 
-        assert_eq!(stats.active_layer, Some(LayerId { layer: 1, datatype: 0 }));
+        assert_eq!(
+            stats.active_layer,
+            Some(LayerId {
+                layer: 1,
+                datatype: 0
+            })
+        );
         assert_eq!(stats.active_layer_pending, 5);
         assert_eq!(stats.active_layer_estimated_work, 32);
-        assert_eq!(stats.active_layer_progress_mode, Some(ActiveLayerProgressMode::Bypassed));
+        assert_eq!(
+            stats.active_layer_progress_mode,
+            Some(ActiveLayerProgressMode::Bypassed)
+        );
         assert_eq!(stats.layer_bypass_entry_threshold, 8);
         assert_eq!(stats.layer_bypass_work_threshold, 128);
     }
@@ -2128,7 +2691,10 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
             scene_revision: 1,
             zoom_bits: 1.0f32.to_bits(),
             tile_id: super::TileId { col, row: 0 },
-            layer: LayerId { layer: 1, datatype: 2 },
+            layer: LayerId {
+                layer: 1,
+                datatype: 2,
+            },
             effective_mode_tag: 0,
             hatch_signature: 0,
             effective_hatch_style_tag: 0,
@@ -2136,49 +2702,61 @@ fn refresh_progressive_queue_drops_stale_entries_on_new_view() {
     }
 }
 
-
 /// 从 tile cache 里选出应该淘汰的条目。
 ///
 /// 当前策略是一个很直接的近似 LRU：
 /// - 优先保住当前可见 tile
 /// - 其余条目按 `last_used_tick` 从旧到新淘汰
 fn select_tile_eviction_victims(
-    usage: &HashMap<TileCacheKey, u64>,
+    usage: &HashMap<TileCacheKey, (u64, usize)>,
     capacity: usize,
+    byte_budget: usize,
     protected: &std::collections::HashSet<TileCacheKey>,
 ) -> Vec<TileCacheKey> {
-    if usage.len() <= capacity {
+    let total_bytes: usize = usage.values().map(|(_, bytes)| *bytes).sum();
+    if usage.len() <= capacity && total_bytes <= byte_budget {
         return Vec::new();
     }
 
     let mut candidates: Vec<_> = usage
         .iter()
         .filter(|(key, _)| !protected.contains(key))
-        .map(|(key, tick)| (*key, *tick))
+        .map(|(key, (tick, bytes))| (*key, *tick, *bytes))
         .collect();
-    candidates.sort_by_key(|(_, tick)| *tick);
+    candidates.sort_by_key(|(_, tick, _)| *tick);
 
-    let required = usage.len().saturating_sub(capacity);
-    candidates
-        .into_iter()
-        .take(required)
-        .map(|(key, _)| key)
-        .collect()
+    let mut remaining_entries = usage.len();
+    let mut remaining_bytes = total_bytes;
+    let mut victims = Vec::new();
+    for (key, _, bytes) in candidates {
+        if remaining_entries <= capacity && remaining_bytes <= byte_budget {
+            break;
+        }
+        victims.push(key);
+        remaining_entries = remaining_entries.saturating_sub(1);
+        remaining_bytes = remaining_bytes.saturating_sub(bytes);
+    }
+    victims
 }
 
 /// 按近似 LRU 规则裁剪 tile cache。
 fn prune_tile_cache(
     cache: &mut HashMap<TileCacheKey, TileCacheEntry>,
     capacity: usize,
+    byte_budget: usize,
     protected: &std::collections::HashSet<TileCacheKey>,
 ) -> usize {
     let usage: HashMap<_, _> = cache
         .iter()
-        .map(|(key, entry)| (*key, entry.last_used_tick))
+        .map(|(key, entry)| (*key, (entry.last_used_tick, entry.byte_size)))
         .collect();
-    let victims = select_tile_eviction_victims(&usage, capacity, protected);
+    let victims = select_tile_eviction_victims(&usage, capacity, byte_budget, protected);
     for victim in &victims {
         cache.remove(victim);
     }
     victims.len()
+}
+
+fn tile_cache_byte_budget(capacity: usize) -> usize {
+    capacity.saturating_mul(TILE_CACHE_BYTES_PER_ENTRY_BUDGET)
 }

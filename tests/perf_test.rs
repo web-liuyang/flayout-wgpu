@@ -28,10 +28,12 @@ fn frame_stats_reports_positive_fps_after_ticks() {
 fn render_stats_history_records_latest_renderer_samples() {
     let mut history = RenderStatsHistory::new();
     history.record(&RenderDebugStats::new(
-        10, 4, 3, 2, 120, 4, 5, 1, 4, 6, 2, 7, 64, 2_048, 0, 2, 5, 9, 12, 16, 3, None, 0, 0, None, false, 8, 128, true, 10.0, 1.5,
+        10, 4, 3, 2, 120, 4, 5, 1, 4, 6, 2, 7, 64, 2_048, 0, 2, 5, 9, 12, 16, 3, None, 0, 0, None,
+        false, 8, 128, true, 10.0, 1.5,
     ));
     history.record(&RenderDebugStats::new(
-        10, 4, 3, 2, 80, 3, 4, 2, 1, 5, 1, 7, 64, 1_024, 0, 2, 5, 9, 4, 16, 5, None, 0, 0, None, false, 8, 128, true, 10.0, 1.5,
+        10, 4, 3, 2, 80, 3, 4, 2, 1, 5, 1, 7, 64, 1_024, 0, 2, 5, 9, 4, 16, 5, None, 0, 0, None,
+        false, 8, 128, true, 10.0, 1.5,
     ));
 
     assert_eq!(history.vertices().latest(), 80.0);

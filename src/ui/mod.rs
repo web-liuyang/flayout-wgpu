@@ -19,16 +19,14 @@ use crate::{
     camera::Camera2D,
     perf::{FrameStats, MetricHistory, RenderStatsHistory},
     renderer::{
-        RenderDebugStats,
-        geometry::{
-            ClosedShapeDrawMode, HatchParams, HatchStylePreset, MAX_HATCH_SPACING,
-            MAX_HATCH_WIDTH, MAX_TILE_GRID_DIVISIONS, MIN_HATCH_SPACING,
-            MIN_HATCH_WIDTH, MIN_TILE_GRID_DIVISIONS,
-        },
         MAX_LAYER_BYPASS_ENTRY_THRESHOLD, MAX_LAYER_BYPASS_WORK_THRESHOLD,
         MAX_PROGRESSIVE_BYPASS_THRESHOLD, MAX_TILE_CACHE_CAPACITY,
         MIN_LAYER_BYPASS_ENTRY_THRESHOLD, MIN_LAYER_BYPASS_WORK_THRESHOLD,
-        MIN_PROGRESSIVE_BYPASS_THRESHOLD, MIN_TILE_CACHE_CAPACITY,
+        MIN_PROGRESSIVE_BYPASS_THRESHOLD, MIN_TILE_CACHE_CAPACITY, RenderDebugStats,
+        geometry::{
+            ClosedShapeDrawMode, HatchParams, HatchStylePreset, MAX_HATCH_SPACING, MAX_HATCH_WIDTH,
+            MAX_TILE_GRID_DIVISIONS, MIN_HATCH_SPACING, MIN_HATCH_WIDTH, MIN_TILE_GRID_DIVISIONS,
+        },
     },
     scene::{LayerId, Scene, SceneBundle},
 };
@@ -118,7 +116,9 @@ pub fn draw_ui(
     let mut next_layer_hatch_styles = layer_hatch_styles.clone();
     let mut next_tile_grid_divisions = tile_grid_divisions;
     let mut next_draw_mode = draw_mode;
-    let mut next_hatch_spacing = hatch_params.spacing.clamp(MIN_HATCH_SPACING, MAX_HATCH_SPACING);
+    let mut next_hatch_spacing = hatch_params
+        .spacing
+        .clamp(MIN_HATCH_SPACING, MAX_HATCH_SPACING);
     let mut next_hatch_width = hatch_params.width.clamp(MIN_HATCH_WIDTH, MAX_HATCH_WIDTH);
     let scene_max_hierarchy_level = full_scene_max_hierarchy_level;
     let mut next_min_hierarchy_level = min_hierarchy_level.min(scene_max_hierarchy_level);
@@ -126,13 +126,20 @@ pub fn draw_ui(
     if next_min_hierarchy_level > next_max_hierarchy_level {
         next_min_hierarchy_level = next_max_hierarchy_level;
     }
-    let mut next_tile_cache_capacity = tile_cache_capacity.clamp(MIN_TILE_CACHE_CAPACITY, MAX_TILE_CACHE_CAPACITY) as u32;
-    let mut next_progressive_bypass_threshold = progressive_bypass_threshold
-        .clamp(MIN_PROGRESSIVE_BYPASS_THRESHOLD, MAX_PROGRESSIVE_BYPASS_THRESHOLD) as u32;
-    let mut next_layer_bypass_entry_threshold = layer_bypass_entry_threshold
-        .clamp(MIN_LAYER_BYPASS_ENTRY_THRESHOLD, MAX_LAYER_BYPASS_ENTRY_THRESHOLD) as u32;
-    let mut next_layer_bypass_work_threshold = layer_bypass_work_threshold
-        .clamp(MIN_LAYER_BYPASS_WORK_THRESHOLD, MAX_LAYER_BYPASS_WORK_THRESHOLD) as u32;
+    let mut next_tile_cache_capacity =
+        tile_cache_capacity.clamp(MIN_TILE_CACHE_CAPACITY, MAX_TILE_CACHE_CAPACITY) as u32;
+    let mut next_progressive_bypass_threshold = progressive_bypass_threshold.clamp(
+        MIN_PROGRESSIVE_BYPASS_THRESHOLD,
+        MAX_PROGRESSIVE_BYPASS_THRESHOLD,
+    ) as u32;
+    let mut next_layer_bypass_entry_threshold = layer_bypass_entry_threshold.clamp(
+        MIN_LAYER_BYPASS_ENTRY_THRESHOLD,
+        MAX_LAYER_BYPASS_ENTRY_THRESHOLD,
+    ) as u32;
+    let mut next_layer_bypass_work_threshold = layer_bypass_work_threshold.clamp(
+        MIN_LAYER_BYPASS_WORK_THRESHOLD,
+        MAX_LAYER_BYPASS_WORK_THRESHOLD,
+    ) as u32;
     let mut layers_changed = false;
     let mut layer_modes_changed = false;
     let mut layer_hatch_styles_changed = false;
@@ -221,7 +228,9 @@ pub fn draw_ui(
                         }
                         ui.label(format!(
                             "Showing levels {}..={} / max {}",
-                            next_min_hierarchy_level, next_max_hierarchy_level, scene_max_hierarchy_level
+                            next_min_hierarchy_level,
+                            next_max_hierarchy_level,
+                            scene_max_hierarchy_level
                         ));
                     }
 
@@ -247,7 +256,10 @@ pub fn draw_ui(
                                             if ui
                                                 .checkbox(
                                                     &mut visible,
-                                                    format!("L{} / D{}", layer.layer, layer.datatype),
+                                                    format!(
+                                                        "L{} / D{}",
+                                                        layer.layer, layer.datatype
+                                                    ),
                                                 )
                                                 .changed()
                                             {
@@ -265,14 +277,33 @@ pub fn draw_ui(
                                                 .get(&layer)
                                                 .copied()
                                                 .unwrap_or(draw_mode);
-                                            egui::ComboBox::from_id_salt(("layer-mode", layer.layer, layer.datatype))
-                                                .selected_text(closed_shape_draw_mode_label(layer_mode))
-                                                .width(100.0)
-                                                .show_ui(ui, |ui| {
-                                                    ui.selectable_value(&mut layer_mode, ClosedShapeDrawMode::Outline, "Outline");
-                                                    ui.selectable_value(&mut layer_mode, ClosedShapeDrawMode::Hatch, "Hatch");
-                                                    ui.selectable_value(&mut layer_mode, ClosedShapeDrawMode::HatchOutline, "Hatch+Outline");
-                                                });
+                                            egui::ComboBox::from_id_salt((
+                                                "layer-mode",
+                                                layer.layer,
+                                                layer.datatype,
+                                            ))
+                                            .selected_text(closed_shape_draw_mode_label(layer_mode))
+                                            .width(100.0)
+                                            .show_ui(
+                                                ui,
+                                                |ui| {
+                                                    ui.selectable_value(
+                                                        &mut layer_mode,
+                                                        ClosedShapeDrawMode::Outline,
+                                                        "Outline",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut layer_mode,
+                                                        ClosedShapeDrawMode::Hatch,
+                                                        "Hatch",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut layer_mode,
+                                                        ClosedShapeDrawMode::HatchOutline,
+                                                        "Hatch+Outline",
+                                                    );
+                                                },
+                                            );
                                             if layer_mode
                                                 != next_layer_draw_modes
                                                     .get(&layer)
@@ -294,17 +325,48 @@ pub fn draw_ui(
                                             // hatch preset 是“每层的记忆配置”，而不是始终正在生效的画法。
                                             // 当当前层被切到 Outline 时，我们把 preset 下拉框置灰，
                                             // 既保留这层未来切回 Hatch 时的图案选择，也避免让用户误以为 preset 仍在当前画面里起作用。
-                                            ui.add_enabled_ui(layer_mode != ClosedShapeDrawMode::Outline, |ui| {
-                                                egui::ComboBox::from_id_salt(("layer-hatch-style", layer.layer, layer.datatype))
+                                            ui.add_enabled_ui(
+                                                layer_mode != ClosedShapeDrawMode::Outline,
+                                                |ui| {
+                                                    egui::ComboBox::from_id_salt((
+                                                        "layer-hatch-style",
+                                                        layer.layer,
+                                                        layer.datatype,
+                                                    ))
                                                     .selected_text(hatch_style_label(hatch_style))
                                                     .width(118.0)
                                                     .show_ui(ui, |ui| {
-                                                        ui.selectable_value(&mut hatch_style, HatchStylePreset::LeftDiagonal, hatch_style_label(HatchStylePreset::LeftDiagonal));
-                                                        ui.selectable_value(&mut hatch_style, HatchStylePreset::RightDiagonal, hatch_style_label(HatchStylePreset::RightDiagonal));
-                                                        ui.selectable_value(&mut hatch_style, HatchStylePreset::Cross, hatch_style_label(HatchStylePreset::Cross));
-                                                        ui.selectable_value(&mut hatch_style, HatchStylePreset::Dots, hatch_style_label(HatchStylePreset::Dots));
+                                                        ui.selectable_value(
+                                                            &mut hatch_style,
+                                                            HatchStylePreset::LeftDiagonal,
+                                                            hatch_style_label(
+                                                                HatchStylePreset::LeftDiagonal,
+                                                            ),
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut hatch_style,
+                                                            HatchStylePreset::RightDiagonal,
+                                                            hatch_style_label(
+                                                                HatchStylePreset::RightDiagonal,
+                                                            ),
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut hatch_style,
+                                                            HatchStylePreset::Cross,
+                                                            hatch_style_label(
+                                                                HatchStylePreset::Cross,
+                                                            ),
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut hatch_style,
+                                                            HatchStylePreset::Dots,
+                                                            hatch_style_label(
+                                                                HatchStylePreset::Dots,
+                                                            ),
+                                                        );
                                                     });
-                                            });
+                                                },
+                                            );
                                             if hatch_style
                                                 != next_layer_hatch_styles
                                                     .get(&layer)
@@ -349,9 +411,21 @@ pub fn draw_ui(
                             ClosedShapeDrawMode::HatchOutline => "Closed shapes: Hatch + Outline",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut next_draw_mode, ClosedShapeDrawMode::Outline, "Closed shapes: Outline");
-                            ui.selectable_value(&mut next_draw_mode, ClosedShapeDrawMode::Hatch, "Closed shapes: Hatch");
-                            ui.selectable_value(&mut next_draw_mode, ClosedShapeDrawMode::HatchOutline, "Closed shapes: Hatch + Outline");
+                            ui.selectable_value(
+                                &mut next_draw_mode,
+                                ClosedShapeDrawMode::Outline,
+                                "Closed shapes: Outline",
+                            );
+                            ui.selectable_value(
+                                &mut next_draw_mode,
+                                ClosedShapeDrawMode::Hatch,
+                                "Closed shapes: Hatch",
+                            );
+                            ui.selectable_value(
+                                &mut next_draw_mode,
+                                ClosedShapeDrawMode::HatchOutline,
+                                "Closed shapes: Hatch + Outline",
+                            );
                         });
                     if next_draw_mode != draw_mode {
                         action.draw_mode = Some(next_draw_mode);
@@ -359,8 +433,11 @@ pub fn draw_ui(
                     let mut hatch_changed = false;
                     if ui
                         .add(
-                            egui::Slider::new(&mut next_hatch_spacing, MIN_HATCH_SPACING..=MAX_HATCH_SPACING)
-                                .text("Hatch spacing"),
+                            egui::Slider::new(
+                                &mut next_hatch_spacing,
+                                MIN_HATCH_SPACING..=MAX_HATCH_SPACING,
+                            )
+                            .text("Hatch spacing"),
                         )
                         .changed()
                     {
@@ -368,8 +445,11 @@ pub fn draw_ui(
                     }
                     if ui
                         .add(
-                            egui::Slider::new(&mut next_hatch_width, MIN_HATCH_WIDTH..=MAX_HATCH_WIDTH)
-                                .text("Hatch width"),
+                            egui::Slider::new(
+                                &mut next_hatch_width,
+                                MIN_HATCH_WIDTH..=MAX_HATCH_WIDTH,
+                            )
+                            .text("Hatch width"),
                         )
                         .changed()
                     {
@@ -413,44 +493,53 @@ pub fn draw_ui(
                         .add(
                             egui::Slider::new(
                                 &mut next_progressive_bypass_threshold,
-                                MIN_PROGRESSIVE_BYPASS_THRESHOLD as u32..=MAX_PROGRESSIVE_BYPASS_THRESHOLD as u32,
+                                MIN_PROGRESSIVE_BYPASS_THRESHOLD as u32
+                                    ..=MAX_PROGRESSIVE_BYPASS_THRESHOLD as u32,
                             )
                             .text("Bypass threshold"),
                         )
                         .changed()
                     {
-                        action.progressive_bypass_threshold = Some(next_progressive_bypass_threshold as usize);
+                        action.progressive_bypass_threshold =
+                            Some(next_progressive_bypass_threshold as usize);
                     }
                     if ui
                         .add(
                             egui::Slider::new(
                                 &mut next_layer_bypass_entry_threshold,
-                                MIN_LAYER_BYPASS_ENTRY_THRESHOLD as u32..=MAX_LAYER_BYPASS_ENTRY_THRESHOLD as u32,
+                                MIN_LAYER_BYPASS_ENTRY_THRESHOLD as u32
+                                    ..=MAX_LAYER_BYPASS_ENTRY_THRESHOLD as u32,
                             )
                             .text("Layer bypass entries"),
                         )
                         .changed()
                     {
-                        action.layer_bypass_entry_threshold = Some(next_layer_bypass_entry_threshold as usize);
+                        action.layer_bypass_entry_threshold =
+                            Some(next_layer_bypass_entry_threshold as usize);
                     }
                     if ui
                         .add(
                             egui::Slider::new(
                                 &mut next_layer_bypass_work_threshold,
-                                MIN_LAYER_BYPASS_WORK_THRESHOLD as u32..=MAX_LAYER_BYPASS_WORK_THRESHOLD as u32,
+                                MIN_LAYER_BYPASS_WORK_THRESHOLD as u32
+                                    ..=MAX_LAYER_BYPASS_WORK_THRESHOLD as u32,
                             )
                             .text("Layer bypass work"),
                         )
                         .changed()
                     {
-                        action.layer_bypass_work_threshold = Some(next_layer_bypass_work_threshold as usize);
+                        action.layer_bypass_work_threshold =
+                            Some(next_layer_bypass_work_threshold as usize);
                     }
                     ui.label(format!("Tile hits: {}", render_debug_stats.tile_cache_hits));
                     ui.label(format!(
                         "Tile misses: {}",
                         render_debug_stats.tile_cache_misses
                     ));
-                    ui.label(format!("Layer hits: {}", render_debug_stats.layer_cache_hits));
+                    ui.label(format!(
+                        "Layer hits: {}",
+                        render_debug_stats.layer_cache_hits
+                    ));
                     ui.label(format!(
                         "Layer misses: {}",
                         render_debug_stats.layer_cache_misses
@@ -463,13 +552,31 @@ pub fn draw_ui(
                             "miss"
                         }
                     ));
-                    ui.label(format!("Cache entries: {} / {}", render_debug_stats.cache_entries, render_debug_stats.cache_capacity));
+                    ui.label(format!(
+                        "Cache entries: {} / {}",
+                        render_debug_stats.cache_entries, render_debug_stats.cache_capacity
+                    ));
                     ui.label(format!("Cache bytes: {}", render_debug_stats.cache_bytes));
-                    ui.label(format!("Cache evictions: {}", render_debug_stats.cache_evictions));
-                    ui.label(format!("Prepared shapes: {}", render_debug_stats.prepared_shapes));
-                    ui.label(format!("Prepared tiles: {}", render_debug_stats.prepared_tiles));
-                    ui.label(format!("Prepared fragments: {}", render_debug_stats.prepared_fragments));
-                    ui.label(format!("Pending entries: {}", render_debug_stats.pending_entries));
+                    ui.label(format!(
+                        "Cache evictions: {}",
+                        render_debug_stats.cache_evictions
+                    ));
+                    ui.label(format!(
+                        "Prepared shapes: {}",
+                        render_debug_stats.prepared_shapes
+                    ));
+                    ui.label(format!(
+                        "Prepared tiles: {}",
+                        render_debug_stats.prepared_tiles
+                    ));
+                    ui.label(format!(
+                        "Prepared fragments: {}",
+                        render_debug_stats.prepared_fragments
+                    ));
+                    ui.label(format!(
+                        "Pending entries: {}",
+                        render_debug_stats.pending_entries
+                    ));
                     ui.label(format!("Build budget: {}", render_debug_stats.build_budget));
                     ui.label(format!(
                         "Progressive mode: {}",
@@ -479,7 +586,10 @@ pub fn draw_ui(
                             "Progressive"
                         }
                     ));
-                    ui.label(format!("Dropped stale entries: {}", render_debug_stats.dropped_stale_entries));
+                    ui.label(format!(
+                        "Dropped stale entries: {}",
+                        render_debug_stats.dropped_stale_entries
+                    ));
                     ui.label(format!(
                         "Active layer: {}",
                         render_debug_stats
@@ -487,13 +597,20 @@ pub fn draw_ui(
                             .map(|layer| format!("L{} / D{}", layer.layer, layer.datatype))
                             .unwrap_or_else(|| "<none>".to_string())
                     ));
-                    ui.label(format!("Active layer pending: {}", render_debug_stats.active_layer_pending));
-                    ui.label(format!("Active layer estimated work: {}", render_debug_stats.active_layer_estimated_work));
+                    ui.label(format!(
+                        "Active layer pending: {}",
+                        render_debug_stats.active_layer_pending
+                    ));
+                    ui.label(format!(
+                        "Active layer estimated work: {}",
+                        render_debug_stats.active_layer_estimated_work
+                    ));
                     ui.label(format!(
                         "Active layer mode: {}",
                         match render_debug_stats.active_layer_progress_mode {
                             Some(crate::renderer::ActiveLayerProgressMode::Bypassed) => "Bypassed",
-                            Some(crate::renderer::ActiveLayerProgressMode::Progressive) => "Progressive",
+                            Some(crate::renderer::ActiveLayerProgressMode::Progressive) =>
+                                "Progressive",
                             None => "<none>",
                         }
                     ));
@@ -534,8 +651,14 @@ pub fn draw_ui(
                         |value| format!("{value:.0}"),
                     );
 
-                    ui.label(format!("Hatch spacing: {:.1}", render_debug_stats.hatch_spacing));
-                    ui.label(format!("Hatch width: {:.1}", render_debug_stats.hatch_width));
+                    ui.label(format!(
+                        "Hatch spacing: {:.1}",
+                        render_debug_stats.hatch_spacing
+                    ));
+                    ui.label(format!(
+                        "Hatch width: {:.1}",
+                        render_debug_stats.hatch_width
+                    ));
 
                     ui.separator();
                     let stats = scene.stats();
@@ -639,7 +762,6 @@ fn hatch_style_label(style: HatchStylePreset) -> &'static str {
         HatchStylePreset::Dots => "Dots (..)",
     }
 }
-
 
 /// 画一个很轻量的 sparkline。
 ///

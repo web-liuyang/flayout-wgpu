@@ -102,6 +102,25 @@ pub struct RenderCacheKey {
     hidden_layers_hash: u64,
 }
 
+impl RenderCacheKey {
+    /// 判断两个缓存 key 是否只在平移上不同。
+    ///
+    /// 这类变化仍然需要重新查询可见 tile，
+    /// 但不应该把整套渐进式构建状态都当成“全新视图”重置掉。
+    pub fn differs_only_by_pan(self, other: Self) -> bool {
+        self.scene_revision == other.scene_revision
+            && self.zoom_bits == other.zoom_bits
+            && self.canvas_origin_x_bits == other.canvas_origin_x_bits
+            && self.canvas_origin_y_bits == other.canvas_origin_y_bits
+            && self.canvas_width_bits == other.canvas_width_bits
+            && self.canvas_height_bits == other.canvas_height_bits
+            && self.viewport_width_bits == other.viewport_width_bits
+            && self.viewport_height_bits == other.viewport_height_bits
+            && self.hidden_layers_hash == other.hidden_layers_hash
+            && (self.pan_x_bits != other.pan_x_bits || self.pan_y_bits != other.pan_y_bits)
+    }
+}
+
 /// tile 网格中的逻辑编号。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TileId {
@@ -126,6 +145,16 @@ pub const MAX_TILE_GRID_DIVISIONS: u32 = 32;
 /// 只有当一个图元横跨足够多的 tile 时，
 /// 预先把它裁成每个 tile 的局部世界坐标碎片才真正划算。
 pub const LARGE_SHAPE_PRE_FRAGMENT_TILE_THRESHOLD: usize = 4;
+/// 预碎片化允许保留的最大 fragment 数。
+///
+/// 超过这个量级后，预碎片化带来的内存副本通常已经不划算，
+/// 这时宁可回退到运行时 tile 裁剪，也不要把整份场景先复制一遍。
+pub const DEFAULT_PREPARED_FRAGMENT_BUDGET: usize = 200_000;
+/// 预碎片化允许保留的最大点复制预算。
+///
+/// 这里统计的是“碎片里会额外复制多少个点”的粗略上限，
+/// 用来防止少量超大 polygon 横跨很多 tile 时提前把内存打满。
+pub const DEFAULT_PREPARED_POINT_BUDGET: usize = 4_000_000;
 
 /// 闭合图形的显示模式。
 ///
@@ -220,6 +249,28 @@ pub struct PreparedTileFragments {
     pub shape_indices: HashSet<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedFragmentBudget {
+    pub max_fragments: usize,
+    pub max_point_copies: usize,
+}
+
+impl PreparedFragmentBudget {
+    pub const fn new(max_fragments: usize, max_point_copies: usize) -> Self {
+        Self {
+            max_fragments,
+            max_point_copies,
+        }
+    }
+
+    pub const fn generous_default() -> Self {
+        Self::new(
+            DEFAULT_PREPARED_FRAGMENT_BUDGET,
+            DEFAULT_PREPARED_POINT_BUDGET,
+        )
+    }
+}
+
 impl PreparedTileFragments {
     /// 被预碎片化路径接管的原始 shape 数量。
     pub fn prepared_shape_count(&self) -> usize {
@@ -241,7 +292,10 @@ impl PreparedTileFragments {
 
     /// 当前 tile 下哪些 layer 拥有预碎片结果。
     pub fn layers_for_tile(&self, tile_id: TileId) -> &[LayerId] {
-        self.tile_layers.get(&tile_id).map(Vec::as_slice).unwrap_or(&[])
+        self.tile_layers
+            .get(&tile_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// 取出某个 `tile + layer` 对应的预碎片列表。
@@ -250,7 +304,9 @@ impl PreparedTileFragments {
         tile_id: TileId,
         layer: LayerId,
     ) -> Option<&[PreparedTileFragment]> {
-        self.per_tile_layer.get(&(tile_id, layer)).map(Vec::as_slice)
+        self.per_tile_layer
+            .get(&(tile_id, layer))
+            .map(Vec::as_slice)
     }
 }
 
@@ -411,7 +467,10 @@ impl TileGridIndex {
                         .entry((tile_id, shape.layer))
                         .or_default()
                         .push(index);
-                    tile_layers_seen.entry(tile_id).or_default().insert(shape.layer);
+                    tile_layers_seen
+                        .entry(tile_id)
+                        .or_default()
+                        .insert(shape.layer);
                 }
             }
         }
@@ -443,7 +502,10 @@ impl TileGridIndex {
 
     /// 取出一个 tile 下出现过哪些 layer。
     pub fn layers_for_tile(&self, tile_id: TileId) -> &[LayerId] {
-        self.tile_layers.get(&tile_id).map(Vec::as_slice).unwrap_or(&[])
+        self.tile_layers
+            .get(&tile_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// 直接取出某个 `tile + layer` 对应的 shape 索引集合。
@@ -461,10 +523,30 @@ impl TileGridIndex {
     /// 这个辅助函数是"预碎片化"的基础：
     /// 我们会先看一个 shape 会覆盖多少 tile，再决定要不要提前切块。
     pub fn tile_ids_for_bounds(&self, bounds: Bounds) -> Vec<TileId> {
-        let min_col = cell_for(bounds.min_x, self.scene_bounds.min_x, self.tile_width, self.cols);
-        let max_col = cell_for(bounds.max_x, self.scene_bounds.min_x, self.tile_width, self.cols);
-        let min_row = cell_for(bounds.min_y, self.scene_bounds.min_y, self.tile_height, self.rows);
-        let max_row = cell_for(bounds.max_y, self.scene_bounds.min_y, self.tile_height, self.rows);
+        let min_col = cell_for(
+            bounds.min_x,
+            self.scene_bounds.min_x,
+            self.tile_width,
+            self.cols,
+        );
+        let max_col = cell_for(
+            bounds.max_x,
+            self.scene_bounds.min_x,
+            self.tile_width,
+            self.cols,
+        );
+        let min_row = cell_for(
+            bounds.min_y,
+            self.scene_bounds.min_y,
+            self.tile_height,
+            self.rows,
+        );
+        let max_row = cell_for(
+            bounds.max_y,
+            self.scene_bounds.min_y,
+            self.tile_height,
+            self.rows,
+        );
 
         let mut tiles = Vec::new();
         for col in min_col..=max_col {
@@ -635,9 +717,25 @@ pub fn prepare_large_shape_tile_fragments(
     tile_grid: &TileGridIndex,
     min_tile_span: usize,
 ) -> PreparedTileFragments {
+    prepare_large_shape_tile_fragments_with_budget(
+        scene,
+        tile_grid,
+        min_tile_span,
+        PreparedFragmentBudget::generous_default(),
+    )
+}
+
+pub fn prepare_large_shape_tile_fragments_with_budget(
+    scene: &Scene,
+    tile_grid: &TileGridIndex,
+    min_tile_span: usize,
+    budget: PreparedFragmentBudget,
+) -> PreparedTileFragments {
     let min_tile_span = min_tile_span.max(2);
     let mut prepared = PreparedTileFragments::default();
     let mut tile_layers_seen: HashMap<TileId, BTreeSet<LayerId>> = HashMap::new();
+    let mut prepared_fragment_budget_used = 0usize;
+    let mut prepared_point_budget_used = 0usize;
 
     for (shape_index, shape) in scene.shapes().iter().enumerate() {
         let tile_ids = tile_grid.tile_ids_for_bounds(shape.bounds);
@@ -645,11 +743,28 @@ pub fn prepare_large_shape_tile_fragments(
             continue;
         }
 
+        let estimated_fragment_count =
+            estimated_fragment_count_for_shape(shape.closed, &shape.points, tile_ids.len());
+        let estimated_point_copies =
+            estimated_point_copies_for_shape(shape.closed, &shape.points, tile_ids.len());
+        if prepared_fragment_budget_used.saturating_add(estimated_fragment_count)
+            > budget.max_fragments
+            || prepared_point_budget_used.saturating_add(estimated_point_copies)
+                > budget.max_point_copies
+        {
+            continue;
+        }
+
         let mut produced_any_fragment = false;
+        let mut produced_fragment_count = 0usize;
+        let mut produced_point_count = 0usize;
         for tile_id in tile_ids {
             let tile_bounds = tile_grid.tile_bounds(tile_id);
             if shape.closed {
-                let clipped = normalized_closed_points(&clip_closed_polygon_to_bounds(&shape.points, tile_bounds));
+                let clipped = normalized_closed_points(&clip_closed_polygon_to_bounds(
+                    &shape.points,
+                    tile_bounds,
+                ));
                 if clipped.len() >= 3 {
                     prepared
                         .per_tile_layer
@@ -660,14 +775,29 @@ pub fn prepare_large_shape_tile_fragments(
                             points: clipped,
                             closed: true,
                             stroke_width_world: shape.stroke_width_world,
-                            outline_segments: clipped_closed_outline_segments(&shape.points, tile_bounds),
+                            outline_segments: clipped_closed_outline_segments(
+                                &shape.points,
+                                tile_bounds,
+                            ),
                         });
-                    tile_layers_seen.entry(tile_id).or_default().insert(shape.layer);
+                    tile_layers_seen
+                        .entry(tile_id)
+                        .or_default()
+                        .insert(shape.layer);
                     produced_any_fragment = true;
+                    produced_fragment_count += 1;
+                    produced_point_count += prepared
+                        .per_tile_layer
+                        .get(&(tile_id, shape.layer))
+                        .and_then(|fragments| fragments.last())
+                        .map(|fragment| fragment.points.len())
+                        .unwrap_or(0);
                 }
             } else {
                 for segment in shape.points.windows(2) {
-                    if let Some((start, end)) = clip_segment_to_bounds(segment[0], segment[1], tile_bounds) {
+                    if let Some((start, end)) =
+                        clip_segment_to_bounds(segment[0], segment[1], tile_bounds)
+                    {
                         prepared
                             .per_tile_layer
                             .entry((tile_id, shape.layer))
@@ -679,8 +809,13 @@ pub fn prepare_large_shape_tile_fragments(
                                 stroke_width_world: shape.stroke_width_world,
                                 outline_segments: Vec::new(),
                             });
-                        tile_layers_seen.entry(tile_id).or_default().insert(shape.layer);
+                        tile_layers_seen
+                            .entry(tile_id)
+                            .or_default()
+                            .insert(shape.layer);
                         produced_any_fragment = true;
+                        produced_fragment_count += 1;
+                        produced_point_count += 2;
                     }
                 }
             }
@@ -688,6 +823,10 @@ pub fn prepare_large_shape_tile_fragments(
 
         if produced_any_fragment {
             prepared.shape_indices.insert(shape_index);
+            prepared_fragment_budget_used =
+                prepared_fragment_budget_used.saturating_add(produced_fragment_count);
+            prepared_point_budget_used =
+                prepared_point_budget_used.saturating_add(produced_point_count);
         }
     }
 
@@ -697,6 +836,22 @@ pub fn prepare_large_shape_tile_fragments(
         .collect();
 
     prepared
+}
+
+fn estimated_fragment_count_for_shape(closed: bool, points: &[Vec2], tile_span: usize) -> usize {
+    if closed {
+        tile_span
+    } else {
+        tile_span.saturating_mul(points.len().saturating_sub(1))
+    }
+}
+
+fn estimated_point_copies_for_shape(closed: bool, points: &[Vec2], tile_span: usize) -> usize {
+    if closed {
+        tile_span.saturating_mul(points.len())
+    } else {
+        estimated_fragment_count_for_shape(closed, points, tile_span).saturating_mul(2)
+    }
 }
 
 /// 为隐藏图层集合计算一个稳定 hash，用于缓存 key。
@@ -1166,7 +1321,13 @@ fn emit_scaled_shape_vertices(
                             outline_color,
                         );
                     } else if outline_points.len() >= 3 {
-                        emit_outline_segments(vertices, &outline_points, true, width, outline_color);
+                        emit_outline_segments(
+                            vertices,
+                            &outline_points,
+                            true,
+                            width,
+                            outline_color,
+                        );
                     }
                 }
             }
@@ -1218,7 +1379,10 @@ fn should_use_coarse_closed_shape_lod(points: &[Vec2]) -> bool {
 
 fn coarse_closed_shape_target_points(points: &[Vec2]) -> Option<usize> {
     let bounds = screen_bounds_from_points(points)?;
-    let extent = bounds.width().max(bounds.height()).clamp(0.0, CLOSED_SHAPE_LOD_MAX_SCREEN_EXTENT);
+    let extent = bounds
+        .width()
+        .max(bounds.height())
+        .clamp(0.0, CLOSED_SHAPE_LOD_MAX_SCREEN_EXTENT);
     let ratio = if CLOSED_SHAPE_LOD_MAX_SCREEN_EXTENT <= f32::EPSILON {
         1.0
     } else {
@@ -1260,7 +1424,10 @@ fn coarse_closed_shape_points(points: &[Vec2]) -> Option<Vec<Vec2>> {
 
 fn coarse_open_polyline_target_points(points: &[Vec2]) -> Option<usize> {
     let bounds = screen_bounds_from_points(points)?;
-    let extent = bounds.width().max(bounds.height()).clamp(0.0, POLYLINE_LOD_MAX_SCREEN_EXTENT);
+    let extent = bounds
+        .width()
+        .max(bounds.height())
+        .clamp(0.0, POLYLINE_LOD_MAX_SCREEN_EXTENT);
     let ratio = if POLYLINE_LOD_MAX_SCREEN_EXTENT <= f32::EPSILON {
         1.0
     } else {
@@ -1323,18 +1490,26 @@ fn clip_closed_polygon_to_bounds(points: &[Vec2], bounds: Bounds) -> Vec<Vec2> {
         return Vec::new();
     }
 
-    output = clip_polygon_against_edge(output, |p| p.x >= bounds.min_x, |a, b| {
-        intersect_vertical(a, b, bounds.min_x)
-    });
-    output = clip_polygon_against_edge(output, |p| p.x <= bounds.max_x, |a, b| {
-        intersect_vertical(a, b, bounds.max_x)
-    });
-    output = clip_polygon_against_edge(output, |p| p.y >= bounds.min_y, |a, b| {
-        intersect_horizontal(a, b, bounds.min_y)
-    });
-    output = clip_polygon_against_edge(output, |p| p.y <= bounds.max_y, |a, b| {
-        intersect_horizontal(a, b, bounds.max_y)
-    });
+    output = clip_polygon_against_edge(
+        output,
+        |p| p.x >= bounds.min_x,
+        |a, b| intersect_vertical(a, b, bounds.min_x),
+    );
+    output = clip_polygon_against_edge(
+        output,
+        |p| p.x <= bounds.max_x,
+        |a, b| intersect_vertical(a, b, bounds.max_x),
+    );
+    output = clip_polygon_against_edge(
+        output,
+        |p| p.y >= bounds.min_y,
+        |a, b| intersect_horizontal(a, b, bounds.min_y),
+    );
+    output = clip_polygon_against_edge(
+        output,
+        |p| p.y <= bounds.max_y,
+        |a, b| intersect_horizontal(a, b, bounds.max_y),
+    );
     normalized_closed_points(&output)
 }
 
@@ -1414,25 +1589,57 @@ fn emit_scaled_prepared_closed_fragment_vertices(
             if let Some(coarse_points) = coarse_lod_points.as_ref() {
                 emit_outline_segments(vertices, coarse_points, true, width, outline_color);
             } else {
-                emit_scaled_outline_segment_pairs(vertices, &fragment.outline_segments, zoom, width, outline_color);
+                emit_scaled_outline_segment_pairs(
+                    vertices,
+                    &fragment.outline_segments,
+                    zoom,
+                    width,
+                    outline_color,
+                );
             }
         }
         ClosedShapeDrawMode::Hatch => {
             if let Some(coarse_points) = coarse_lod_points.as_ref() {
-                emit_polygon_fill(vertices, coarse_points, fill_color(fragment.layer), hatch_style);
+                emit_polygon_fill(
+                    vertices,
+                    coarse_points,
+                    fill_color(fragment.layer),
+                    hatch_style,
+                );
             } else if fill_points.len() >= 3 {
-                emit_polygon_fill(vertices, &fill_points, fill_color(fragment.layer), hatch_style);
+                emit_polygon_fill(
+                    vertices,
+                    &fill_points,
+                    fill_color(fragment.layer),
+                    hatch_style,
+                );
             }
         }
         ClosedShapeDrawMode::HatchOutline => {
             if let Some(coarse_points) = coarse_lod_points.as_ref() {
-                emit_polygon_fill(vertices, coarse_points, fill_color(fragment.layer), hatch_style);
+                emit_polygon_fill(
+                    vertices,
+                    coarse_points,
+                    fill_color(fragment.layer),
+                    hatch_style,
+                );
                 emit_outline_segments(vertices, coarse_points, true, width, outline_color);
             } else {
                 if fill_points.len() >= 3 {
-                    emit_polygon_fill(vertices, &fill_points, fill_color(fragment.layer), hatch_style);
+                    emit_polygon_fill(
+                        vertices,
+                        &fill_points,
+                        fill_color(fragment.layer),
+                        hatch_style,
+                    );
                 }
-                emit_scaled_outline_segment_pairs(vertices, &fragment.outline_segments, zoom, width, outline_color);
+                emit_scaled_outline_segment_pairs(
+                    vertices,
+                    &fragment.outline_segments,
+                    zoom,
+                    width,
+                    outline_color,
+                );
             }
         }
     }
@@ -1537,7 +1744,10 @@ fn clip_segment_to_bounds(start: Vec2, end: Vec2, bounds: Bounds) -> Option<(Vec
         }
     }
 
-    Some((start + Vec2::new(dx, dy) * t0, start + Vec2::new(dx, dy) * t1))
+    Some((
+        start + Vec2::new(dx, dy) * t0,
+        start + Vec2::new(dx, dy) * t1,
+    ))
 }
 
 /// 将逻辑屏幕坐标顶点转成 NDC 顶点。
@@ -1616,7 +1826,18 @@ fn emit_polygon_fill(
     color: [f32; 4],
     hatch_style: HatchStylePreset,
 ) {
-    let Some(indices) = triangulate_polygon(points) else {
+    let local_points = points
+        .first()
+        .copied()
+        .map(|origin| {
+            points
+                .iter()
+                .copied()
+                .map(|point| point - origin)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let Some(indices) = triangulate_polygon(&local_points) else {
         return;
     };
 
@@ -1739,8 +1960,7 @@ fn point_in_triangle(point: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
     let ab = (b - a).perp_dot(point - a);
     let bc = (c - b).perp_dot(point - b);
     let ca = (a - c).perp_dot(point - c);
-    (ab >= -1e-5 && bc >= -1e-5 && ca >= -1e-5)
-        || (ab <= 1e-5 && bc <= 1e-5 && ca <= 1e-5)
+    (ab >= -1e-5 && bc >= -1e-5 && ca >= -1e-5) || (ab <= 1e-5 && bc <= 1e-5 && ca <= 1e-5)
 }
 
 /// 把一条线段膨胀成两个三角形。

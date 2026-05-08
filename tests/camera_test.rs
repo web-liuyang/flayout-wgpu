@@ -8,7 +8,13 @@
 //! - 放大后还能缩回 fit 比例
 
 use approx::assert_relative_eq;
-use flayout_wgpu::{app::{apply_pan_delta, should_degrade_interaction_render, should_request_continuous_redraw, should_request_redraw_after_window_event}, camera::Camera2D};
+use flayout_wgpu::{
+    app::{
+        apply_pan_delta, should_degrade_interaction_render, should_request_continuous_redraw,
+        should_request_redraw_after_window_event,
+    },
+    camera::Camera2D,
+};
 use glam::Vec2;
 
 /// 最基础的缩放行为：滚轮放大后 zoom 应该变大。

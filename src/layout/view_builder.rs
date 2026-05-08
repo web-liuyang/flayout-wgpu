@@ -24,6 +24,14 @@ pub struct LayoutViewBuildOptions {
     pub min_hierarchy_level: u32,
     pub max_hierarchy_level: u32,
     pub visible_world_bounds: Option<Bounds>,
+    pub subtree_screen_lod: Option<SubtreeScreenLod>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubtreeScreenLod {
+    pub world_to_screen_scale: f32,
+    pub min_subtree_screen_extent: f32,
+    pub min_collapse_hierarchy_level: u32,
 }
 
 /// view builder 的最小错误集合。
@@ -62,6 +70,13 @@ pub fn build_layout_view_scene(
     Ok(Scene::from_shapes(shapes))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SubtreeExpansionDecision {
+    Expand,
+    CollapseToProxy(Bounds, SubtreeScreenLod),
+    Skip,
+}
+
 impl LayoutViewBuildOptions {
     /// 构造一组最小 build 选项。
     pub fn new(
@@ -74,12 +89,28 @@ impl LayoutViewBuildOptions {
             min_hierarchy_level,
             max_hierarchy_level,
             visible_world_bounds: None,
+            subtree_screen_lod: None,
         }
     }
 
     /// 给构建选项补一个可选视口范围。
     pub fn with_visible_world_bounds(mut self, visible_world_bounds: Option<Bounds>) -> Self {
         self.visible_world_bounds = visible_world_bounds;
+        self
+    }
+
+    /// 给子树递归补一层基于屏幕尺寸的 LOD 裁剪。
+    pub fn with_subtree_screen_lod(
+        mut self,
+        world_to_screen_scale: f32,
+        min_subtree_screen_extent: f32,
+        min_collapse_hierarchy_level: u32,
+    ) -> Self {
+        self.subtree_screen_lod = Some(SubtreeScreenLod {
+            world_to_screen_scale,
+            min_subtree_screen_extent,
+            min_collapse_hierarchy_level,
+        });
         self
     }
 }
@@ -150,13 +181,28 @@ fn expand_instance_into_scene(
             for row in 0..*rows {
                 for col in 0..*columns {
                     let delta = *column_step * col as f32 + *row_step * row as f32;
-                    let repeated_transform = base_transform.with_extra_translation(delta);
-                    if !subtree_might_be_visible(
+                    let repeated_transform = base_transform
+                        .with_extra_translation(parent_world_transform.apply_vector(delta));
+                    match classify_subtree_expansion(
                         target_cell,
+                        child_hierarchy_level,
                         repeated_transform,
-                        options.visible_world_bounds,
+                        options,
                     ) {
-                        continue;
+                        SubtreeExpansionDecision::Expand => {}
+                        SubtreeExpansionDecision::CollapseToProxy(bounds, lod) => {
+                            if let Some(proxy_shape) = collapsed_subtree_proxy_shape(
+                                bundle,
+                                target_cell,
+                                child_hierarchy_level,
+                                bounds,
+                                lod,
+                            ) {
+                                output.push(proxy_shape);
+                            }
+                            continue;
+                        }
+                        SubtreeExpansionDecision::Skip => continue,
                     }
                     expand_cell_into_scene(
                         bundle,
@@ -170,9 +216,26 @@ fn expand_instance_into_scene(
             }
         }
         None => {
-            if !subtree_might_be_visible(target_cell, base_transform, options.visible_world_bounds)
-            {
-                return;
+            match classify_subtree_expansion(
+                target_cell,
+                child_hierarchy_level,
+                base_transform,
+                options,
+            ) {
+                SubtreeExpansionDecision::Expand => {}
+                SubtreeExpansionDecision::CollapseToProxy(bounds, lod) => {
+                    if let Some(proxy_shape) = collapsed_subtree_proxy_shape(
+                        bundle,
+                        target_cell,
+                        child_hierarchy_level,
+                        bounds,
+                        lod,
+                    ) {
+                        output.push(proxy_shape);
+                    }
+                    return;
+                }
+                SubtreeExpansionDecision::Skip => return,
             }
             expand_cell_into_scene(
                 bundle,
@@ -222,15 +285,89 @@ fn expand_shape(
 }
 
 /// 通过 cell 的局部 bounds 做视口裁剪，避免不必要地递归进入整个子树。
-fn subtree_might_be_visible(
+fn classify_subtree_expansion(
     cell: &LayoutCell,
+    hierarchy_level: u32,
     world_transform: AffineTransform,
-    visible_world_bounds: Option<Bounds>,
-) -> bool {
+    options: &LayoutViewBuildOptions,
+) -> SubtreeExpansionDecision {
     let subtree_bounds = cell
         .local_bounds()
         .map(|bounds| transform_bounds(bounds, world_transform));
-    intersects_visible_world(subtree_bounds, visible_world_bounds)
+    if !intersects_visible_world(subtree_bounds, options.visible_world_bounds) {
+        return SubtreeExpansionDecision::Skip;
+    }
+
+    match (subtree_bounds, options.subtree_screen_lod) {
+        (Some(subtree_bounds), Some(lod))
+            if hierarchy_level >= lod.min_collapse_hierarchy_level
+                && hierarchy_level > options.min_hierarchy_level
+                && subtree_screen_extent(subtree_bounds, lod.world_to_screen_scale)
+                    < lod.min_subtree_screen_extent =>
+        {
+            SubtreeExpansionDecision::CollapseToProxy(subtree_bounds, lod)
+        }
+        _ => SubtreeExpansionDecision::Expand,
+    }
+}
+
+fn collapsed_subtree_proxy_shape(
+    bundle: &LayoutBundle,
+    cell: &LayoutCell,
+    hierarchy_level: u32,
+    bounds: Bounds,
+    lod: SubtreeScreenLod,
+) -> Option<RectShape> {
+    let layer = representative_layer_for_cell(bundle, cell)?;
+    let center = bounds.center();
+    let marker_world_extent =
+        (lod.min_subtree_screen_extent / lod.world_to_screen_scale.max(f32::EPSILON)).max(1.0);
+    let half = marker_world_extent * 0.5;
+    Some(RectShape::from_points(
+        layer,
+        vec![
+            Vec2::new(center.x - half, center.y),
+            Vec2::new(center.x + half, center.y),
+        ],
+        false,
+        hierarchy_level,
+        Some(marker_world_extent * 0.5),
+    ))
+}
+
+fn representative_layer_for_cell(
+    bundle: &LayoutBundle,
+    cell: &LayoutCell,
+) -> Option<crate::scene::LayerId> {
+    representative_layer_for_cell_inner(bundle, cell, &mut std::collections::BTreeSet::new())
+}
+
+fn representative_layer_for_cell_inner(
+    bundle: &LayoutBundle,
+    cell: &LayoutCell,
+    visiting: &mut std::collections::BTreeSet<LayoutCellId>,
+) -> Option<crate::scene::LayerId> {
+    if let Some(layer) = cell.local_layers().first().copied() {
+        return Some(layer);
+    }
+    if !visiting.insert(cell.id()) {
+        return None;
+    }
+    for instance in cell.instances() {
+        let Some(target_cell) = bundle.cell(instance.target_cell_id()) else {
+            continue;
+        };
+        if let Some(layer) = representative_layer_for_cell_inner(bundle, target_cell, visiting) {
+            visiting.remove(&cell.id());
+            return Some(layer);
+        }
+    }
+    visiting.remove(&cell.id());
+    None
+}
+
+fn subtree_screen_extent(bounds: Bounds, world_to_screen_scale: f32) -> f32 {
+    bounds.width().max(bounds.height()).max(0.0) * world_to_screen_scale.max(0.0)
 }
 
 fn intersects_visible_world(

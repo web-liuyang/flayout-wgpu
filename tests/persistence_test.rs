@@ -1,12 +1,15 @@
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use flayout_wgpu::{
     persistence::{
-        filter_hidden_layers_for_scene, filter_layer_draw_modes_for_scene,
-        filter_layer_hatch_styles_for_scene,
-        load_viewer_config_from_path, resolve_saved_view_index, save_viewer_config_to_path,
         PersistedCamera, PersistedClosedShapeDrawMode, PersistedHatchStylePreset,
         PersistedLayerDrawMode, PersistedLayerHatchStyle, PersistedLayerId, ViewerConfig,
+        filter_hidden_layers_for_scene, filter_layer_draw_modes_for_scene,
+        filter_layer_hatch_styles_for_scene, load_viewer_config_from_path,
+        resolve_saved_view_index, save_viewer_config_to_path,
     },
     renderer::geometry::{ClosedShapeDrawMode, HatchStylePreset},
     scene::{Bounds, LayerId, RectShape, Scene, SceneBundle, SceneView},
@@ -15,11 +18,17 @@ use flayout_wgpu::{
 fn sample_scene() -> Scene {
     Scene::from_shapes(vec![
         RectShape::rectangle(
-            LayerId { layer: 1, datatype: 1 },
+            LayerId {
+                layer: 1,
+                datatype: 1,
+            },
             Bounds::new(0.0, 0.0, 10.0, 10.0),
         ),
         RectShape::rectangle(
-            LayerId { layer: 70, datatype: 30 },
+            LayerId {
+                layer: 70,
+                datatype: 30,
+            },
             Bounds::new(20.0, 20.0, 40.0, 40.0),
         ),
     ])
@@ -36,13 +45,22 @@ fn sample_config() -> ViewerConfig {
         },
         min_hierarchy_level: Some(1),
         max_hierarchy_level: Some(3),
-        hidden_layers: vec![PersistedLayerId { layer: 70, datatype: 30 }],
+        hidden_layers: vec![PersistedLayerId {
+            layer: 70,
+            datatype: 30,
+        }],
         layer_draw_modes: vec![PersistedLayerDrawMode {
-            layer: PersistedLayerId { layer: 1, datatype: 1 },
+            layer: PersistedLayerId {
+                layer: 1,
+                datatype: 1,
+            },
             mode: PersistedClosedShapeDrawMode::Outline,
         }],
         layer_hatch_styles: vec![PersistedLayerHatchStyle {
-            layer: PersistedLayerId { layer: 70, datatype: 30 },
+            layer: PersistedLayerId {
+                layer: 70,
+                datatype: 30,
+            },
             style: PersistedHatchStylePreset::Cross,
         }],
         draw_mode: PersistedClosedShapeDrawMode::HatchOutline,
@@ -107,26 +125,44 @@ fn scene_layer_filters_ignore_unknown_saved_layers() {
     let scene = sample_scene();
     let config = ViewerConfig {
         hidden_layers: vec![
-            PersistedLayerId { layer: 70, datatype: 30 },
-            PersistedLayerId { layer: 999, datatype: 0 },
+            PersistedLayerId {
+                layer: 70,
+                datatype: 30,
+            },
+            PersistedLayerId {
+                layer: 999,
+                datatype: 0,
+            },
         ],
         layer_draw_modes: vec![
             PersistedLayerDrawMode {
-                layer: PersistedLayerId { layer: 1, datatype: 1 },
+                layer: PersistedLayerId {
+                    layer: 1,
+                    datatype: 1,
+                },
                 mode: PersistedClosedShapeDrawMode::Outline,
             },
             PersistedLayerDrawMode {
-                layer: PersistedLayerId { layer: 999, datatype: 0 },
+                layer: PersistedLayerId {
+                    layer: 999,
+                    datatype: 0,
+                },
                 mode: PersistedClosedShapeDrawMode::Hatch,
             },
         ],
         layer_hatch_styles: vec![
             PersistedLayerHatchStyle {
-                layer: PersistedLayerId { layer: 70, datatype: 30 },
+                layer: PersistedLayerId {
+                    layer: 70,
+                    datatype: 30,
+                },
                 style: PersistedHatchStylePreset::Dots,
             },
             PersistedLayerHatchStyle {
-                layer: PersistedLayerId { layer: 999, datatype: 0 },
+                layer: PersistedLayerId {
+                    layer: 999,
+                    datatype: 0,
+                },
                 style: PersistedHatchStylePreset::RightDiagonal,
             },
         ],
@@ -137,23 +173,34 @@ fn scene_layer_filters_ignore_unknown_saved_layers() {
     let draw_modes = filter_layer_draw_modes_for_scene(&config, &scene);
     let hatch_styles = filter_layer_hatch_styles_for_scene(&config, &scene);
 
-    assert_eq!(hidden, BTreeSet::from([LayerId { layer: 70, datatype: 30 }]));
+    assert_eq!(
+        hidden,
+        BTreeSet::from([LayerId {
+            layer: 70,
+            datatype: 30
+        }])
+    );
     assert_eq!(
         draw_modes,
         BTreeMap::from([(
-            LayerId { layer: 1, datatype: 1 },
+            LayerId {
+                layer: 1,
+                datatype: 1
+            },
             ClosedShapeDrawMode::Outline,
         )])
     );
     assert_eq!(
         hatch_styles,
         BTreeMap::from([(
-            LayerId { layer: 70, datatype: 30 },
+            LayerId {
+                layer: 70,
+                datatype: 30
+            },
             HatchStylePreset::Dots,
         )])
     );
 }
-
 
 #[test]
 fn layer_bypass_thresholds_round_trip_through_viewer_config() {

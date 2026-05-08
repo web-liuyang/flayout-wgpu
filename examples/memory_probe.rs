@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, env};
 
 use flayout_wgpu::{
     io::{load_layout_bundle, load_layout_hierarchy_bundle},
-    layout::{build_layout_view_scene, LayoutBundle, LayoutCellId, LayoutViewBuildOptions},
+    layout::{LayoutBundle, LayoutCellId, LayoutViewBuildOptions, build_layout_view_scene},
     renderer::geometry::{
         DEFAULT_TILE_GRID_DIVISIONS, LARGE_SHAPE_PRE_FRAGMENT_TILE_THRESHOLD, TileGridIndex,
         prepare_large_shape_tile_fragments,
@@ -11,10 +11,16 @@ use flayout_wgpu::{
 };
 
 fn main() {
-    let path = env::args().nth(1).expect("usage: cargo run --example memory_probe -- <layout> [view-name] [min-level] [max-level]");
+    let path = env::args().nth(1).expect(
+        "usage: cargo run --example memory_probe -- <layout> [view-name] [min-level] [max-level]",
+    );
     let view_name = env::args().nth(2);
-    let min_level = env::args().nth(3).and_then(|value| value.parse::<u32>().ok());
-    let max_level = env::args().nth(4).and_then(|value| value.parse::<u32>().ok());
+    let min_level = env::args()
+        .nth(3)
+        .and_then(|value| value.parse::<u32>().ok());
+    let max_level = env::args()
+        .nth(4)
+        .and_then(|value| value.parse::<u32>().ok());
 
     if path.to_ascii_lowercase().ends_with(".gds") {
         let bundle = load_layout_hierarchy_bundle(&path).expect("load hierarchical bundle");
@@ -45,7 +51,10 @@ fn main() {
     println!("mode=flat-legacy");
     println!(
         "view={}",
-        view_name.unwrap_or_else(|| bundle.current_view().map(|v| v.name.clone()).unwrap_or_default())
+        view_name.unwrap_or_else(|| bundle
+            .current_view()
+            .map(|v| v.name.clone())
+            .unwrap_or_default())
     );
     print_scene_stats(scene);
 }
@@ -57,11 +66,8 @@ fn print_scene_stats(scene: &Scene) {
     let layers = scene.layer_ids().len();
 
     let grid = TileGridIndex::build_with_divisions(scene, DEFAULT_TILE_GRID_DIVISIONS);
-    let prepared = prepare_large_shape_tile_fragments(
-        scene,
-        &grid,
-        LARGE_SHAPE_PRE_FRAGMENT_TILE_THRESHOLD,
-    );
+    let prepared =
+        prepare_large_shape_tile_fragments(scene, &grid, LARGE_SHAPE_PRE_FRAGMENT_TILE_THRESHOLD);
 
     let prepared_points: usize = prepared
         .per_tile_layer
@@ -131,7 +137,10 @@ fn select_scene<'a>(
     }
 }
 
-fn compute_layout_root_max_hierarchy_level(bundle: &LayoutBundle, root_cell_id: LayoutCellId) -> u32 {
+fn compute_layout_root_max_hierarchy_level(
+    bundle: &LayoutBundle,
+    root_cell_id: LayoutCellId,
+) -> u32 {
     fn visit(
         bundle: &LayoutBundle,
         cell_id: LayoutCellId,

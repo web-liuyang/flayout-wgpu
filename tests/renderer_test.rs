@@ -17,14 +17,15 @@ use flayout_wgpu::{
         RenderDebugStats,
         geometry::{
             ClosedShapeDrawMode, DEFAULT_HATCH_SPACING, DEFAULT_HATCH_WIDTH, HatchParams,
-            HatchStylePreset,
-            ShapeSpatialIndex, TileGridIndex, TileId, build_hatch_signature, build_line_vertices,
-            build_hatch_style_signature, build_render_cache_key,
-            build_render_cache_key_with_hatch_styles, build_scaled_scene_vertices_for_indices,
+            HatchStylePreset, PreparedFragmentBudget, ShapeSpatialIndex, TileGridIndex, TileId,
+            build_hatch_signature, build_hatch_style_signature, build_line_vertices,
+            build_render_cache_key, build_render_cache_key_with_hatch_styles,
+            build_scaled_scene_vertices_for_indices,
             build_scaled_scene_vertices_for_indices_with_hatch_styles,
-            build_scaled_scene_vertices_for_prepared_fragments, build_scaled_scene_vertices_for_tile,
-            build_scene_vertices, layer_draw_mode_hash_value, layer_hatch_style_hash_value,
-            logical_viewport_size, ndc_bounds, prepare_large_shape_tile_fragments,
+            build_scaled_scene_vertices_for_prepared_fragments,
+            build_scaled_scene_vertices_for_tile, build_scene_vertices, layer_draw_mode_hash_value,
+            layer_hatch_style_hash_value, logical_viewport_size, ndc_bounds,
+            prepare_large_shape_tile_fragments, prepare_large_shape_tile_fragments_with_budget,
             query_visible_shape_indices, query_visible_shapes, query_visible_tiles,
         },
     },
@@ -63,7 +64,6 @@ fn rectangle_scene_builds_clip_space_line_vertices() {
     );
 }
 
-
 /// 闭合图形在 `Hatch` 模式下应该真正生成 hatch 填充三角形，
 /// 而不是继续只画轮廓。
 #[test]
@@ -96,15 +96,26 @@ fn rectangle_scene_builds_hatch_fill_vertices_in_hatch_mode() {
 
     // 一个矩形面被三角扇拆成 2 个三角形，共 6 个顶点。
     assert_eq!(vertices.len(), 6);
-    assert!(vertices.iter().all(|vertex| vertex.position[0].abs() <= 1.0));
-    assert!(vertices.iter().all(|vertex| vertex.position[1].abs() <= 1.0));
+    assert!(
+        vertices
+            .iter()
+            .all(|vertex| vertex.position[0].abs() <= 1.0)
+    );
+    assert!(
+        vertices
+            .iter()
+            .all(|vertex| vertex.position[1].abs() <= 1.0)
+    );
 }
 
 /// 当高点数闭合图形在屏幕上已经缩得很小时，
 /// viewer 应该切到更粗的 LOD，而不是继续保留所有原始轮廓细节。
 #[test]
 fn coarse_lod_keeps_non_axis_aligned_shape_character() {
-    let layer = LayerId { layer: 600, datatype: 10 };
+    let layer = LayerId {
+        layer: 600,
+        datatype: 10,
+    };
     let base = [
         Vec2::new(0.0, -80.0),
         Vec2::new(55.0, -25.0),
@@ -145,14 +156,22 @@ fn coarse_lod_keeps_non_axis_aligned_shape_character() {
     );
     let unique_positions: std::collections::BTreeSet<(i32, i32)> = vertices
         .iter()
-        .map(|vertex| ((vertex.position[0] * 100.0).round() as i32, (vertex.position[1] * 100.0).round() as i32))
+        .map(|vertex| {
+            (
+                (vertex.position[0] * 100.0).round() as i32,
+                (vertex.position[1] * 100.0).round() as i32,
+            )
+        })
         .collect();
     assert!(unique_positions.len() > 8);
 }
 
 #[test]
 fn smaller_screen_extent_uses_stronger_closed_shape_lod() {
-    let layer = LayerId { layer: 600, datatype: 10 };
+    let layer = LayerId {
+        layer: 600,
+        datatype: 10,
+    };
     let point_count = 720usize;
     let radius = 50.0f32;
     let points: Vec<Vec2> = (0..point_count)
@@ -197,7 +216,10 @@ fn smaller_screen_extent_uses_stronger_closed_shape_lod() {
 
 #[test]
 fn small_high_detail_closed_shapes_switch_to_coarse_lod() {
-    let layer = LayerId { layer: 600, datatype: 10 };
+    let layer = LayerId {
+        layer: 600,
+        datatype: 10,
+    };
     let point_count = 720usize;
     let radius = 50.0f32;
     let points: Vec<Vec2> = (0..point_count)
@@ -246,7 +268,10 @@ fn small_high_detail_closed_shapes_switch_to_coarse_lod() {
 #[test]
 fn hatch_presets_encode_different_fill_vertex_styles_for_shader_path() {
     let shape = RectShape::rectangle(
-        LayerId { layer: 1, datatype: 2 },
+        LayerId {
+            layer: 1,
+            datatype: 2,
+        },
         Bounds::new(0.0, 0.0, 10.0, 20.0),
     );
     let scene = Scene::from_shapes(vec![shape]);
@@ -342,7 +367,10 @@ fn rectangle_scene_builds_hatch_and_outline_vertices_in_hatch_outline_mode() {
 
 #[test]
 fn small_high_detail_polyline_switches_to_coarse_lod() {
-    let layer = LayerId { layer: 600, datatype: 10 };
+    let layer = LayerId {
+        layer: 600,
+        datatype: 10,
+    };
     let point_count = 720usize;
     let points: Vec<Vec2> = (0..point_count)
         .map(|idx| {
@@ -420,7 +448,10 @@ fn open_polyline_stays_outline_only_in_hatch_mode() {
 /// 如果还在用简单三角扇，凹多边形通常会出现明显面积膨胀。
 #[test]
 fn concave_polygon_hatch_fill_preserves_polygon_area() {
-    let layer = LayerId { layer: 7, datatype: 0 };
+    let layer = LayerId {
+        layer: 7,
+        datatype: 0,
+    };
     let points = vec![
         Vec2::new(0.0, 0.0),
         Vec2::new(6.0, 0.0),
@@ -457,6 +488,150 @@ fn concave_polygon_hatch_fill_preserves_polygon_area() {
     );
 }
 
+/// 带共线中间点的正交闭合轮廓不应该因为耳切三角化而丢失填充。
+///
+/// `example_mzi_perf.gds` 在某些 zoom 下会出现这类轮廓：
+/// 本质上是矩形/台阶矩形，但边上插入了若干共线控制点。
+/// 如果不先把这些“纯共线中间点”清掉，当前耳切实现可能完全切不出三角形。
+#[test]
+fn orthogonal_polygon_with_collinear_vertices_keeps_hatch_fill_area() {
+    let layer = LayerId {
+        layer: 1,
+        datatype: 2,
+    };
+    let points = vec![
+        Vec2::new(0.0, 48.0),
+        Vec2::new(39.0, 48.0),
+        Vec2::new(39.0, 28.0),
+        Vec2::new(39.0, 19.0),
+        Vec2::new(39.0, 0.0),
+        Vec2::new(0.0, 0.0),
+        Vec2::new(0.0, 19.0),
+        Vec2::new(0.0, 28.0),
+        Vec2::new(0.0, 48.0),
+    ];
+    let scene = Scene::from_shapes(vec![RectShape {
+        layer,
+        hierarchy_level: 0,
+        bounds: Bounds::new(0.0, 0.0, 39.0, 48.0),
+        points: points.clone(),
+        closed: true,
+        stroke_width_world: None,
+    }]);
+
+    let vertices = build_scaled_scene_vertices_for_indices(
+        &scene,
+        1.0,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &[0],
+        ClosedShapeDrawMode::Hatch,
+    );
+
+    let polygon_area = polygon_area(&points);
+    let fill_area = triangles_area(&vertices);
+
+    assert!(
+        (fill_area - polygon_area).abs() < 0.01,
+        "expected fill area {fill_area} to match polygon area {polygon_area}"
+    );
+}
+
+#[test]
+fn large_translated_orthogonal_polygon_keeps_hatch_fill_area() {
+    let layer = LayerId {
+        layer: 1,
+        datatype: 2,
+    };
+    let origin = Vec2::new(34_275_000.0, 18_773_748.0);
+    let points = vec![
+        origin + Vec2::new(0.0, 4800.0),
+        origin + Vec2::new(1750.0, 4800.0),
+        origin + Vec2::new(1750.0, 2850.0),
+        origin + Vec2::new(1750.0, 1950.0),
+        origin + Vec2::new(1750.0, 0.0),
+        origin + Vec2::new(0.0, 176.0),
+        origin + Vec2::new(0.0, 2124.0),
+        origin + Vec2::new(0.0, 2676.0),
+        origin + Vec2::new(0.0, 4800.0),
+    ];
+    let scene = Scene::from_shapes(vec![RectShape {
+        layer,
+        hierarchy_level: 0,
+        bounds: Bounds::new(origin.x, origin.y, origin.x + 1750.0, origin.y + 4800.0),
+        points: points.clone(),
+        closed: true,
+        stroke_width_world: None,
+    }]);
+
+    let vertices = build_scaled_scene_vertices_for_indices(
+        &scene,
+        0.02240417,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &[0],
+        ClosedShapeDrawMode::Hatch,
+    );
+
+    let polygon_area = polygon_area(
+        &points
+            .iter()
+            .map(|point| *point * 0.02240417)
+            .collect::<Vec<_>>(),
+    );
+    let fill_area = triangles_area(&vertices);
+
+    assert!(
+        (fill_area - polygon_area).abs() / polygon_area.max(1.0) < 0.01,
+        "expected fill area {fill_area} to match polygon area {polygon_area}"
+    );
+}
+
+#[test]
+fn large_translated_slender_polygon_keeps_hatch_fill_vertices() {
+    let layer = LayerId {
+        layer: 1,
+        datatype: 2,
+    };
+    let points = vec![
+        Vec2::new(34_275_000.0, 18_778_372.0),
+        Vec2::new(34_276_750.0, 18_778_548.0),
+        Vec2::new(34_276_750.0, 18_776_598.0),
+        Vec2::new(34_276_750.0, 18_775_698.0),
+        Vec2::new(34_276_750.0, 18_773_748.0),
+        Vec2::new(34_275_000.0, 18_773_924.0),
+        Vec2::new(34_275_000.0, 18_775_872.0),
+        Vec2::new(34_275_000.0, 18_776_424.0),
+        Vec2::new(34_275_000.0, 18_778_372.0),
+    ];
+    let scene = Scene::from_shapes(vec![RectShape {
+        layer,
+        hierarchy_level: 0,
+        bounds: Bounds::new(34_275_000.0, 18_773_748.0, 34_276_750.0, 18_778_548.0),
+        points,
+        closed: true,
+        stroke_width_world: None,
+    }]);
+
+    let vertices = build_scaled_scene_vertices_for_indices(
+        &scene,
+        0.02240417,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &[0],
+        ClosedShapeDrawMode::Hatch,
+    );
+
+    let fill_vertex_count = vertices
+        .iter()
+        .filter(|vertex| (vertex.kind - 1.0).abs() < 0.1)
+        .count();
+
+    assert!(
+        fill_vertex_count > 0,
+        "expected hatch fill vertices for slender translated polygon"
+    );
+}
 
 /// 用真实 GDS 的弯曲边界做回归，避免只靠人造简单多边形误判。
 #[test]
@@ -473,7 +648,9 @@ fn bend_euler_outer_polygon_fill_matches_polygon_area() {
         .max_by(|a, b| {
             let area_a = polygon_area(&a.points);
             let area_b = polygon_area(&b.points);
-            area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
+            area_a
+                .partial_cmp(&area_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
         })
         .expect("outer polygon");
 
@@ -512,7 +689,10 @@ fn vias_45_top_and_bottom_fragments_still_build_hatch_fill_vertices() {
         .expect("Vias_s view");
     let grid = TileGridIndex::build_with_divisions(scene, 8);
     let prepared = prepare_large_shape_tile_fragments(scene, &grid, 4);
-    let target_layer = LayerId { layer: 70, datatype: 30 };
+    let target_layer = LayerId {
+        layer: 70,
+        datatype: 30,
+    };
 
     let zero_fill_fragments = prepared
         .per_tile_layer
@@ -527,7 +707,9 @@ fn vias_45_top_and_bottom_fragments_still_build_hatch_fill_vertices() {
                 &BTreeMap::new(),
                 ClosedShapeDrawMode::Hatch,
             );
-            !vertices.iter().any(|vertex| (vertex.kind - 1.0).abs() < 0.1)
+            !vertices
+                .iter()
+                .any(|vertex| (vertex.kind - 1.0).abs() < 0.1)
         })
         .count();
 
@@ -537,13 +719,19 @@ fn vias_45_top_and_bottom_fragments_still_build_hatch_fill_vertices() {
 #[test]
 fn layer_override_can_force_outline_when_global_mode_is_hatch_outline() {
     let shape = RectShape::rectangle(
-        LayerId { layer: 1, datatype: 2 },
+        LayerId {
+            layer: 1,
+            datatype: 2,
+        },
         Bounds::new(0.0, 0.0, 10.0, 20.0),
     );
     let scene = Scene::from_shapes(vec![shape]);
     let mut overrides = BTreeMap::new();
     overrides.insert(
-        LayerId { layer: 1, datatype: 2 },
+        LayerId {
+            layer: 1,
+            datatype: 2,
+        },
         ClosedShapeDrawMode::Outline,
     );
 
@@ -571,7 +759,10 @@ fn tile_local_clipping_reduces_large_polygon_vertices() {
     }
 
     let shape = RectShape {
-        layer: LayerId { layer: 1, datatype: 2 },
+        layer: LayerId {
+            layer: 1,
+            datatype: 2,
+        },
         hierarchy_level: 0,
         bounds: Bounds::new(0.0, 0.0, 99.0, 49.9),
         points,
@@ -615,7 +806,10 @@ fn prepared_tile_fragments_match_runtime_tile_clipping_for_large_polygon() {
     }
 
     let shape = RectShape {
-        layer: LayerId { layer: 1, datatype: 2 },
+        layer: LayerId {
+            layer: 1,
+            datatype: 2,
+        },
         hierarchy_level: 0,
         bounds: Bounds::new(0.0, 0.0, 99.0, 49.9),
         points,
@@ -630,7 +824,9 @@ fn prepared_tile_fragments_match_runtime_tile_clipping_for_large_polygon() {
 
     let (&tile_id, layers) = prepared.tile_layers.iter().next().expect("prepared tile");
     let layer = *layers.first().expect("prepared layer");
-    let fragments = prepared.fragments_for_tile_layer(tile_id, layer).expect("prepared fragments");
+    let fragments = prepared
+        .fragments_for_tile_layer(tile_id, layer)
+        .expect("prepared fragments");
     let tile_bounds = grid.tile_bounds(tile_id);
     for fragment in fragments {
         assert!(fragment.points.iter().all(|point| {
@@ -667,7 +863,10 @@ fn prepared_tile_fragments_match_runtime_tile_clipping_for_large_polygon() {
 #[test]
 fn prepared_tile_fragments_match_runtime_tile_clipping_for_large_polyline() {
     let shape = RectShape::polyline(
-        LayerId { layer: 70, datatype: 31 },
+        LayerId {
+            layer: 70,
+            datatype: 31,
+        },
         vec![Vec2::new(0.0, 0.0), Vec2::new(100.0, 100.0)],
         6.0,
     );
@@ -679,7 +878,9 @@ fn prepared_tile_fragments_match_runtime_tile_clipping_for_large_polyline() {
 
     let (&tile_id, layers) = prepared.tile_layers.iter().next().expect("prepared tile");
     let layer = *layers.first().expect("prepared layer");
-    let fragments = prepared.fragments_for_tile_layer(tile_id, layer).expect("prepared fragments");
+    let fragments = prepared
+        .fragments_for_tile_layer(tile_id, layer)
+        .expect("prepared fragments");
     let tile_bounds = grid.tile_bounds(tile_id);
     let prepared_vertices = build_scaled_scene_vertices_for_prepared_fragments(
         fragments,
@@ -801,7 +1002,10 @@ fn render_cache_key_changes_when_hatch_params_change() {
         Vec2::new(1160.0, 960.0),
         Vec2::new(1440.0, 960.0),
         ClosedShapeDrawMode::Hatch,
-        HatchParams { spacing: 8.0, width: 1.0 },
+        HatchParams {
+            spacing: 8.0,
+            width: 1.0,
+        },
     );
     let b = build_render_cache_key(
         7,
@@ -812,7 +1016,10 @@ fn render_cache_key_changes_when_hatch_params_change() {
         Vec2::new(1160.0, 960.0),
         Vec2::new(1440.0, 960.0),
         ClosedShapeDrawMode::Hatch,
-        HatchParams { spacing: 12.0, width: 1.0 },
+        HatchParams {
+            spacing: 12.0,
+            width: 1.0,
+        },
     );
     let c = build_render_cache_key(
         7,
@@ -823,14 +1030,23 @@ fn render_cache_key_changes_when_hatch_params_change() {
         Vec2::new(1160.0, 960.0),
         Vec2::new(1440.0, 960.0),
         ClosedShapeDrawMode::HatchOutline,
-        HatchParams { spacing: 8.0, width: 2.0 },
+        HatchParams {
+            spacing: 8.0,
+            width: 2.0,
+        },
     );
 
     assert_ne!(a, b);
     assert_ne!(a, c);
     assert_ne!(
-        build_hatch_signature(HatchParams { spacing: 8.0, width: 1.0 }),
-        build_hatch_signature(HatchParams { spacing: 12.0, width: 1.0 }),
+        build_hatch_signature(HatchParams {
+            spacing: 8.0,
+            width: 1.0
+        }),
+        build_hatch_signature(HatchParams {
+            spacing: 12.0,
+            width: 1.0
+        }),
     );
 }
 
@@ -843,7 +1059,10 @@ fn render_cache_key_changes_when_layer_draw_modes_change() {
     let hidden = BTreeSet::new();
     let mut overrides = BTreeMap::new();
     overrides.insert(
-        LayerId { layer: 1, datatype: 2 },
+        LayerId {
+            layer: 1,
+            datatype: 2,
+        },
         ClosedShapeDrawMode::Outline,
     );
 
@@ -856,7 +1075,10 @@ fn render_cache_key_changes_when_layer_draw_modes_change() {
         Vec2::new(1160.0, 960.0),
         Vec2::new(1440.0, 960.0),
         ClosedShapeDrawMode::HatchOutline,
-        HatchParams { spacing: 8.0, width: 1.0 },
+        HatchParams {
+            spacing: 8.0,
+            width: 1.0,
+        },
     );
     let b = build_render_cache_key(
         7,
@@ -867,11 +1089,17 @@ fn render_cache_key_changes_when_layer_draw_modes_change() {
         Vec2::new(1160.0, 960.0),
         Vec2::new(1440.0, 960.0),
         ClosedShapeDrawMode::HatchOutline,
-        HatchParams { spacing: 8.0, width: 1.0 },
+        HatchParams {
+            spacing: 8.0,
+            width: 1.0,
+        },
     );
 
     assert_ne!(a, b);
-    assert_ne!(layer_draw_mode_hash_value(&BTreeMap::new()), layer_draw_mode_hash_value(&overrides));
+    assert_ne!(
+        layer_draw_mode_hash_value(&BTreeMap::new()),
+        layer_draw_mode_hash_value(&overrides)
+    );
 }
 
 /// hatch style 变化也必须进入 render cache key，
@@ -892,7 +1120,10 @@ fn render_cache_key_changes_when_hatch_style_changes() {
         Vec2::new(1160.0, 960.0),
         Vec2::new(1440.0, 960.0),
         ClosedShapeDrawMode::Hatch,
-        HatchParams { spacing: 8.0, width: 1.0 },
+        HatchParams {
+            spacing: 8.0,
+            width: 1.0,
+        },
         HatchStylePreset::LeftDiagonal,
     );
     let b = build_render_cache_key_with_hatch_styles(
@@ -905,12 +1136,21 @@ fn render_cache_key_changes_when_hatch_style_changes() {
         Vec2::new(1160.0, 960.0),
         Vec2::new(1440.0, 960.0),
         ClosedShapeDrawMode::Hatch,
-        HatchParams { spacing: 8.0, width: 1.0 },
+        HatchParams {
+            spacing: 8.0,
+            width: 1.0,
+        },
         HatchStylePreset::Cross,
     );
 
     let mut style_overrides = BTreeMap::new();
-    style_overrides.insert(LayerId { layer: 1, datatype: 2 }, HatchStylePreset::Dots);
+    style_overrides.insert(
+        LayerId {
+            layer: 1,
+            datatype: 2,
+        },
+        HatchStylePreset::Dots,
+    );
     let c = build_render_cache_key_with_hatch_styles(
         7,
         &camera,
@@ -921,7 +1161,10 @@ fn render_cache_key_changes_when_hatch_style_changes() {
         Vec2::new(1160.0, 960.0),
         Vec2::new(1440.0, 960.0),
         ClosedShapeDrawMode::Hatch,
-        HatchParams { spacing: 8.0, width: 1.0 },
+        HatchParams {
+            spacing: 8.0,
+            width: 1.0,
+        },
         HatchStylePreset::LeftDiagonal,
     );
 
@@ -1038,7 +1281,10 @@ fn visible_shape_query_reports_bucket_and_candidate_stats() {
 /// 渲染调试统计结构本身要能正确保存所有字段。
 #[test]
 fn render_debug_stats_capture_query_and_cache_state() {
-    let stats = RenderDebugStats::new(9, 3, 2, 1, 24, 2, 2, 1, 1, 4, 2, 12, 64, 768, 3, 2, 5, 9, 6, 16, 2, None, 0, 0, None, false, 8, 128, true, 10.0, 1.5);
+    let stats = RenderDebugStats::new(
+        9, 3, 2, 1, 24, 2, 2, 1, 1, 4, 2, 12, 64, 768, 3, 2, 5, 9, 6, 16, 2, None, 0, 0, None,
+        false, 8, 128, true, 10.0, 1.5,
+    );
 
     assert_eq!(stats.total_shapes, 9);
     assert_eq!(stats.candidate_shapes, 3);
@@ -1068,32 +1314,68 @@ fn render_debug_stats_capture_query_and_cache_state() {
 fn tile_grid_provides_tile_layer_shape_indices() {
     let scene = Scene::from_shapes(vec![
         RectShape::rectangle(
-            LayerId { layer: 1, datatype: 1 },
+            LayerId {
+                layer: 1,
+                datatype: 1,
+            },
             Bounds::new(0.0, 0.0, 10.0, 10.0),
         ),
         RectShape::rectangle(
-            LayerId { layer: 1, datatype: 2 },
+            LayerId {
+                layer: 1,
+                datatype: 2,
+            },
             Bounds::new(0.0, 0.0, 10.0, 10.0),
         ),
         RectShape::rectangle(
-            LayerId { layer: 1, datatype: 2 },
+            LayerId {
+                layer: 1,
+                datatype: 2,
+            },
             Bounds::new(0.0, 0.0, 8.0, 8.0),
         ),
     ]);
     let grid = TileGridIndex::build_with_divisions(&scene, 2);
     let tile_id = TileId { col: 0, row: 0 };
 
-    assert!(grid.layers_for_tile(tile_id).contains(&LayerId { layer: 1, datatype: 1 }));
-    assert!(grid.layers_for_tile(tile_id).contains(&LayerId { layer: 1, datatype: 2 }));
-    assert_eq!(grid.shape_indices_for_tile_layer(tile_id, LayerId { layer: 1, datatype: 1 }), &[0]);
-    assert_eq!(grid.shape_indices_for_tile_layer(tile_id, LayerId { layer: 1, datatype: 2 }), &[1, 2]);
+    assert!(grid.layers_for_tile(tile_id).contains(&LayerId {
+        layer: 1,
+        datatype: 1
+    }));
+    assert!(grid.layers_for_tile(tile_id).contains(&LayerId {
+        layer: 1,
+        datatype: 2
+    }));
+    assert_eq!(
+        grid.shape_indices_for_tile_layer(
+            tile_id,
+            LayerId {
+                layer: 1,
+                datatype: 1
+            }
+        ),
+        &[0]
+    );
+    assert_eq!(
+        grid.shape_indices_for_tile_layer(
+            tile_id,
+            LayerId {
+                layer: 1,
+                datatype: 2
+            }
+        ),
+        &[1, 2]
+    );
 }
 
 /// 预碎片化统计应该能反映一个大图元被切到多少 tile 和 fragment。
 #[test]
 fn prepared_tile_fragments_report_shape_tile_and_fragment_counts() {
     let shape = RectShape::rectangle(
-        LayerId { layer: 1, datatype: 2 },
+        LayerId {
+            layer: 1,
+            datatype: 2,
+        },
         Bounds::new(0.0, 0.0, 100.0, 100.0),
     );
     let scene = Scene::from_shapes(vec![shape]);
@@ -1104,6 +1386,31 @@ fn prepared_tile_fragments_report_shape_tile_and_fragment_counts() {
     assert_eq!(prepared.prepared_tile_count(), 16);
     assert_eq!(prepared.prepared_fragment_count(), 16);
     assert!(prepared.layers_for_tile(TileId { col: 0, row: 0 }).len() >= 1);
+}
+
+/// 当预碎片化预算太小无法安全容纳某个超大 shape 时，
+/// 应该直接回退到运行时 tile 裁剪，而不是继续复制几何吃穿内存。
+#[test]
+fn prepared_tile_fragments_skip_shape_when_budget_would_be_exceeded() {
+    let shape = RectShape::rectangle(
+        LayerId {
+            layer: 1,
+            datatype: 2,
+        },
+        Bounds::new(0.0, 0.0, 100.0, 100.0),
+    );
+    let scene = Scene::from_shapes(vec![shape]);
+    let grid = TileGridIndex::build_with_divisions(&scene, 4);
+    let prepared = prepare_large_shape_tile_fragments_with_budget(
+        &scene,
+        &grid,
+        4,
+        PreparedFragmentBudget::new(8, 64),
+    );
+
+    assert_eq!(prepared.prepared_shape_count(), 0);
+    assert_eq!(prepared.prepared_tile_count(), 0);
+    assert_eq!(prepared.prepared_fragment_count(), 0);
 }
 
 /// tile 查询只应返回和可见范围相交的 tile。

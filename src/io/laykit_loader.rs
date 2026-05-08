@@ -23,8 +23,8 @@ use std::sync::Arc;
 use glam::Vec2;
 use laykit::{
     ArrayRef, Boundary, ExtensionScheme, GDSBox, GDSElement, GDSIIFile, GDSStructure, GPath,
-    OASISCell, OASISElement, OASISFile, OPath, Placement, Polygon, Rectangle, Repetition,
-    STrans, StructRef,
+    OASISCell, OASISElement, OASISFile, OPath, Placement, Polygon, Rectangle, Repetition, STrans,
+    StructRef,
 };
 
 use crate::error::AppError;
@@ -88,7 +88,6 @@ impl Transform2D {
         }
     }
 
-
     /// 只构造“线性部分”，不包含平移。
     ///
     /// 这里统一处理：
@@ -133,11 +132,9 @@ impl Transform2D {
     /// 从一个 GDS `STrans` 构造实例局部变换。
     fn from_gds_reference(origin: Vec2, strans: Option<&STrans>) -> Self {
         let linear = match strans {
-            Some(strans) => Self::from_linear_parts(
-                strans.reflection,
-                strans.angle,
-                strans.magnification,
-            ),
+            Some(strans) => {
+                Self::from_linear_parts(strans.reflection, strans.angle, strans.magnification)
+            }
             None => Self::identity(),
         };
 
@@ -149,11 +146,8 @@ impl Transform2D {
 
     /// 从一个 OASIS `Placement` 构造实例局部变换。
     fn from_oasis_placement(placement: &Placement) -> Self {
-        let linear = Self::from_linear_parts(
-            placement.mirror,
-            placement.angle,
-            placement.magnification,
-        );
+        let linear =
+            Self::from_linear_parts(placement.mirror, placement.angle, placement.magnification);
 
         Self {
             translation: Vec2::new(placement.x as f32, placement.y as f32),
@@ -332,7 +326,10 @@ fn build_gds_layout_bundle(gds: &GDSIIFile) -> Result<LayoutBundle, AppError> {
             let root_cell_id = *cell_ids
                 .get(structure.name.as_str())
                 .expect("root cell id exists");
-            LayoutView::new(LayoutViewMetadata::new(structure.name.clone(), root_cell_id))
+            LayoutView::new(LayoutViewMetadata::new(
+                structure.name.clone(),
+                root_cell_id,
+            ))
         })
         .collect();
 
@@ -648,11 +645,8 @@ fn raw_instance_to_layout_instance(
         Bounds::new(origin.x, origin.y, origin.x, origin.y)
     });
 
-    let mut layout_instance = LayoutInstance::with_transform(
-        instance.target_cell_id,
-        local_bounds,
-        instance.transform,
-    );
+    let mut layout_instance =
+        LayoutInstance::with_transform(instance.target_cell_id, local_bounds, instance.transform);
 
     if let Some(repetition) = instance.repetition.clone() {
         layout_instance = layout_instance.with_repetition(repetition);
@@ -701,13 +695,13 @@ fn raw_instance_bounds(instance: &RawGdsInstance, target_bounds: Option<Bounds>)
 fn layout_transform_from_gds_reference(origin: Vec2, strans: Option<&STrans>) -> LayoutTransform {
     LayoutTransform {
         translation: origin,
-        rotation_degrees: strans
-            .and_then(|transform| transform.angle)
-            .unwrap_or(0.0) as f32,
+        rotation_degrees: strans.and_then(|transform| transform.angle).unwrap_or(0.0) as f32,
         magnification: strans
             .and_then(|transform| transform.magnification)
             .unwrap_or(1.0) as f32,
-        mirrored_x: strans.map(|transform| transform.reflection).unwrap_or(false),
+        mirrored_x: strans
+            .map(|transform| transform.reflection)
+            .unwrap_or(false),
     }
 }
 
@@ -783,30 +777,24 @@ fn collect_gds_shapes(
             GDSElement::Boundary(boundary) => {
                 push_boundary(shapes, boundary, transform, hierarchy_level)
             }
-            GDSElement::Box(gds_box) => {
-                push_gds_box(shapes, gds_box, transform, hierarchy_level)
-            }
+            GDSElement::Box(gds_box) => push_gds_box(shapes, gds_box, transform, hierarchy_level),
             GDSElement::Path(path) => push_gds_path(shapes, path, transform, hierarchy_level),
-            GDSElement::StructRef(sref) => {
-                expand_gds_struct_ref(
-                    sref,
-                    structures_by_name,
-                    transform,
-                    hierarchy_level,
-                    stack,
-                    shapes,
-                )?
-            }
-            GDSElement::ArrayRef(aref) => {
-                expand_gds_array_ref(
-                    aref,
-                    structures_by_name,
-                    transform,
-                    hierarchy_level,
-                    stack,
-                    shapes,
-                )?
-            }
+            GDSElement::StructRef(sref) => expand_gds_struct_ref(
+                sref,
+                structures_by_name,
+                transform,
+                hierarchy_level,
+                stack,
+                shapes,
+            )?,
+            GDSElement::ArrayRef(aref) => expand_gds_array_ref(
+                aref,
+                structures_by_name,
+                transform,
+                hierarchy_level,
+                stack,
+                shapes,
+            )?,
             _ => {}
         }
     }
@@ -831,19 +819,15 @@ fn collect_oasis_shapes(
             OASISElement::Polygon(polygon) => {
                 push_polygon(shapes, polygon, transform, hierarchy_level)?
             }
-            OASISElement::Path(path) => {
-                push_oasis_path(shapes, path, transform, hierarchy_level)?
-            }
-            OASISElement::Placement(placement) => {
-                expand_oasis_placement(
-                    placement,
-                    cells_by_name,
-                    transform,
-                    hierarchy_level,
-                    stack,
-                    shapes,
-                )?
-            }
+            OASISElement::Path(path) => push_oasis_path(shapes, path, transform, hierarchy_level)?,
+            OASISElement::Placement(placement) => expand_oasis_placement(
+                placement,
+                cells_by_name,
+                transform,
+                hierarchy_level,
+                stack,
+                shapes,
+            )?,
             _ => {}
         }
     }
@@ -1092,7 +1076,6 @@ fn push_rectangle(
 
     Ok(())
 }
-
 
 /// 将 OASIS polygon 转成内部闭合轮廓。
 ///
@@ -1521,10 +1504,12 @@ mod tests {
         let centers: Vec<Vec2> = scene
             .shapes()
             .iter()
-            .map(|shape| Vec2::new(
-                (shape.bounds.min_x + shape.bounds.max_x) * 0.5,
-                (shape.bounds.min_y + shape.bounds.max_y) * 0.5,
-            ))
+            .map(|shape| {
+                Vec2::new(
+                    (shape.bounds.min_x + shape.bounds.max_x) * 0.5,
+                    (shape.bounds.min_y + shape.bounds.max_y) * 0.5,
+                )
+            })
             .collect();
 
         assert_eq!(centers.len(), 16);
@@ -1659,7 +1644,6 @@ mod tests {
         assert_bounds_close(shape.bounds, (-6.0, -6.0, 36.0, 6.0));
     }
 
-
     /// 回归测试：
     /// OASIS 的图元 repetition 不是元数据装饰，而是真的会复制出多个实例。
     /// 这里先锁住最常见的 `Matrix` 阵列展开。
@@ -1748,7 +1732,6 @@ mod tests {
         assert_eq!(scene.stats().shape_count, 3);
         assert_bounds_close(scene.bounds().expect("bounds"), (50.0, 80.0, 140.0, 90.0));
     }
-
 
     /// 回归测试：
     /// OASIS Polygon 需要把 `x/y` 基点和相对点列拼成真实轮廓，
@@ -1845,8 +1828,14 @@ mod tests {
     }
 
     fn assert_vec2_close(actual: Vec2, expected: Vec2) {
-        assert!((actual.x - expected.x).abs() < 0.01, "x mismatch: {actual:?} vs {expected:?}");
-        assert!((actual.y - expected.y).abs() < 0.01, "y mismatch: {actual:?} vs {expected:?}");
+        assert!(
+            (actual.x - expected.x).abs() < 0.01,
+            "x mismatch: {actual:?} vs {expected:?}"
+        );
+        assert!(
+            (actual.y - expected.y).abs() < 0.01,
+            "y mismatch: {actual:?} vs {expected:?}"
+        );
     }
 
     fn sample_name_table() -> laykit::NameTable {
