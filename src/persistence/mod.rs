@@ -186,7 +186,7 @@ impl PersistedHatchStylePreset {
 }
 
 pub fn viewer_config_path() -> Result<PathBuf, PersistenceError> {
-    let dirs = ProjectDirs::from("io", "openai", "flayout-wgpu")
+    let dirs = ProjectDirs::from("com", "webliuyang", "flayout-wgpu")
         .ok_or(PersistenceError::ConfigDirUnavailable)?;
     Ok(dirs.config_dir().join("viewer-config.json"))
 }
