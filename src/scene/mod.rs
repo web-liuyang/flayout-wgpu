@@ -9,9 +9,41 @@
 //! 因为版图解析库的原始数据结构往往会带很多格式细节，
 //! 如果渲染层直接依赖它们，后面很容易牵一发动全身。
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, ops::Deref, sync::Arc};
 
 use glam::Vec2;
+
+#[derive(Debug, Clone)]
+pub enum ShapePoints {
+    InlineRect([Vec2; 4]),
+    Heap(Vec<Vec2>),
+}
+
+impl ShapePoints {
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::InlineRect(_))
+    }
+}
+
+impl From<Vec<Vec2>> for ShapePoints {
+    fn from(points: Vec<Vec2>) -> Self {
+        match points.as_slice() {
+            [a, b, c, d] => Self::InlineRect([*a, *b, *c, *d]),
+            _ => Self::Heap(points),
+        }
+    }
+}
+
+impl Deref for ShapePoints {
+    type Target = [Vec2];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::InlineRect(points) => points,
+            Self::Heap(points) => points.as_slice(),
+        }
+    }
+}
 
 /// 一个轴对齐包围盒。
 ///
@@ -81,7 +113,7 @@ pub struct RectShape {
     ///
     /// - 对闭合 shape，这是轮廓点
     /// - 对 path，这是中心线点序列
-    pub points: Vec<Vec2>,
+    pub points: ShapePoints,
 
     /// 是否闭合。
     pub closed: bool,
@@ -144,7 +176,7 @@ impl RectShape {
             layer,
             hierarchy_level,
             bounds,
-            points,
+            points: points.into(),
             closed,
             stroke_width_world,
         }
@@ -164,7 +196,8 @@ impl RectShape {
                 Vec2::new(bounds.max_x, bounds.min_y),
                 Vec2::new(bounds.max_x, bounds.max_y),
                 Vec2::new(bounds.min_x, bounds.max_y),
-            ],
+            ]
+            .into(),
             closed: true,
             stroke_width_world: None,
         }
@@ -416,4 +449,43 @@ fn bounds_from_points(points: &[Vec2]) -> Option<Bounds> {
         max_y = max_y.max(point.y);
     }
     Some(Bounds::new(min_x, min_y, max_x, max_y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rectangle_points_stay_inline() {
+        let shape = RectShape::rectangle(
+            LayerId {
+                layer: 1,
+                datatype: 0,
+            },
+            Bounds::new(0.0, 0.0, 10.0, 10.0),
+        );
+
+        assert!(shape.points.is_inline());
+        assert_eq!(shape.points.len(), 4);
+    }
+
+    #[test]
+    fn larger_polygons_can_still_spill_when_needed() {
+        let points = (0..8)
+            .map(|index| Vec2::new(index as f32, (index % 2) as f32))
+            .collect::<Vec<_>>();
+        let shape = RectShape::from_points(
+            LayerId {
+                layer: 1,
+                datatype: 0,
+            },
+            points,
+            true,
+            0,
+            None,
+        );
+
+        assert!(!shape.points.is_inline());
+        assert_eq!(shape.points.len(), 8);
+    }
 }

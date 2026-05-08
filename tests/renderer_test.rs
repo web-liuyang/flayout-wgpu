@@ -139,7 +139,7 @@ fn coarse_lod_keeps_non_axis_aligned_shape_character() {
         layer,
         hierarchy_level: 0,
         bounds: Bounds::new(-110.0, -80.0, 110.0, 80.0),
-        points,
+        points: points.into(),
         closed: true,
         stroke_width_world: None,
     }]);
@@ -184,7 +184,7 @@ fn smaller_screen_extent_uses_stronger_closed_shape_lod() {
         layer,
         hierarchy_level: 0,
         bounds: Bounds::new(-radius, -radius, radius, radius),
-        points,
+        points: points.into(),
         closed: true,
         stroke_width_world: None,
     }]);
@@ -215,6 +215,84 @@ fn smaller_screen_extent_uses_stronger_closed_shape_lod() {
 }
 
 #[test]
+fn tiny_closed_shape_uses_compact_marker_in_hatch_outline_mode() {
+    let layer = LayerId {
+        layer: 601,
+        datatype: 10,
+    };
+    let scene = Scene::from_shapes(vec![RectShape::rectangle(
+        layer,
+        Bounds::new(0.0, 0.0, 100.0, 100.0),
+    )]);
+    let hidden = BTreeSet::new();
+
+    let vertices = build_scaled_scene_vertices_for_indices_with_hatch_styles(
+        &scene,
+        0.01,
+        &hidden,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &[0],
+        ClosedShapeDrawMode::HatchOutline,
+        HatchStylePreset::LeftDiagonal,
+    );
+
+    assert_eq!(vertices.len(), 6);
+}
+
+#[test]
+fn small_closed_shape_suppresses_hatch_fill_before_falling_to_marker() {
+    let layer = LayerId {
+        layer: 602,
+        datatype: 10,
+    };
+    let scene = Scene::from_shapes(vec![RectShape::rectangle(
+        layer,
+        Bounds::new(0.0, 0.0, 100.0, 100.0),
+    )]);
+    let hidden = BTreeSet::new();
+
+    let vertices = build_scaled_scene_vertices_for_indices_with_hatch_styles(
+        &scene,
+        0.08,
+        &hidden,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &[0],
+        ClosedShapeDrawMode::HatchOutline,
+        HatchStylePreset::LeftDiagonal,
+    );
+
+    assert_eq!(vertices.len(), 24);
+}
+
+#[test]
+fn visible_closed_shape_keeps_user_hatch_outline_configuration() {
+    let layer = LayerId {
+        layer: 603,
+        datatype: 10,
+    };
+    let scene = Scene::from_shapes(vec![RectShape::rectangle(
+        layer,
+        Bounds::new(0.0, 0.0, 100.0, 100.0),
+    )]);
+    let hidden = BTreeSet::new();
+
+    let vertices = build_scaled_scene_vertices_for_indices_with_hatch_styles(
+        &scene,
+        0.15,
+        &hidden,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &[0],
+        ClosedShapeDrawMode::HatchOutline,
+        HatchStylePreset::LeftDiagonal,
+    );
+
+    assert_eq!(vertices.len(), 30);
+}
+
+#[test]
 fn small_high_detail_closed_shapes_switch_to_coarse_lod() {
     let layer = LayerId {
         layer: 600,
@@ -232,7 +310,7 @@ fn small_high_detail_closed_shapes_switch_to_coarse_lod() {
         layer,
         hierarchy_level: 0,
         bounds: Bounds::new(-radius, -radius, radius, radius),
-        points,
+        points: points.into(),
         closed: true,
         stroke_width_world: None,
     }]);
@@ -464,7 +542,7 @@ fn concave_polygon_hatch_fill_preserves_polygon_area() {
         layer,
         hierarchy_level: 0,
         bounds: Bounds::new(0.0, 0.0, 6.0, 6.0),
-        points: points.clone(),
+        points: points.clone().into(),
         closed: true,
         stroke_width_world: None,
     };
@@ -514,7 +592,7 @@ fn orthogonal_polygon_with_collinear_vertices_keeps_hatch_fill_area() {
         layer,
         hierarchy_level: 0,
         bounds: Bounds::new(0.0, 0.0, 39.0, 48.0),
-        points: points.clone(),
+        points: points.clone().into(),
         closed: true,
         stroke_width_world: None,
     }]);
@@ -559,7 +637,7 @@ fn large_translated_orthogonal_polygon_keeps_hatch_fill_area() {
         layer,
         hierarchy_level: 0,
         bounds: Bounds::new(origin.x, origin.y, origin.x + 1750.0, origin.y + 4800.0),
-        points: points.clone(),
+        points: points.clone().into(),
         closed: true,
         stroke_width_world: None,
     }]);
@@ -608,7 +686,7 @@ fn large_translated_slender_polygon_keeps_hatch_fill_vertices() {
         layer,
         hierarchy_level: 0,
         bounds: Bounds::new(34_275_000.0, 18_773_748.0, 34_276_750.0, 18_778_548.0),
-        points,
+        points: points.into(),
         closed: true,
         stroke_width_world: None,
     }]);
@@ -765,7 +843,7 @@ fn tile_local_clipping_reduces_large_polygon_vertices() {
         },
         hierarchy_level: 0,
         bounds: Bounds::new(0.0, 0.0, 99.0, 49.9),
-        points,
+        points: points.into(),
         closed: true,
         stroke_width_world: None,
     };
@@ -812,7 +890,7 @@ fn prepared_tile_fragments_match_runtime_tile_clipping_for_large_polygon() {
         },
         hierarchy_level: 0,
         bounds: Bounds::new(0.0, 0.0, 99.0, 49.9),
-        points,
+        points: points.into(),
         closed: true,
         stroke_width_world: None,
     };

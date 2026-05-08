@@ -27,6 +27,12 @@ use crate::{
     scene::{Bounds, LayerId, RectShape, Scene},
 };
 
+type ShapeIndex = u32;
+
+fn encode_shape_index(index: usize) -> ShapeIndex {
+    u32::try_from(index).expect("shape index must fit into u32")
+}
+
 /// 最终写入 GPU vertex buffer 的顶点格式。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable, PartialEq)]
@@ -78,6 +84,9 @@ const CLOSED_SHAPE_LOD_MIN_POINTS: usize = 64;
 const CLOSED_SHAPE_LOD_MAX_SCREEN_EXTENT: f32 = 24.0;
 const CLOSED_SHAPE_LOD_MIN_TARGET_POINTS: usize = 8;
 const CLOSED_SHAPE_LOD_MAX_TARGET_POINTS: usize = 24;
+const TINY_SHAPE_MARKER_MAX_SCREEN_EXTENT: f32 = 2.0;
+const TINY_SHAPE_MARKER_SCREEN_SIZE: f32 = 1.5;
+const SMALL_CLOSED_SHAPE_OUTLINE_ONLY_MAX_SCREEN_EXTENT: f32 = 12.0;
 const POLYLINE_LOD_MIN_POINTS: usize = 64;
 const POLYLINE_LOD_MAX_SCREEN_EXTENT: f32 = 24.0;
 const POLYLINE_LOD_MIN_TARGET_POINTS: usize = 6;
@@ -198,7 +207,7 @@ pub struct ShapeSpatialIndex {
     cell_height: f32,
     cols: i32,
     rows: i32,
-    buckets: HashMap<(i32, i32), Vec<usize>>,
+    buckets: HashMap<(i32, i32), Vec<ShapeIndex>>,
 }
 
 /// tile 级缓存使用的网格索引。
@@ -213,9 +222,8 @@ pub struct TileGridIndex {
     tile_height: f32,
     cols: i32,
     rows: i32,
-    buckets: HashMap<TileId, Vec<usize>>,
     tile_layers: HashMap<TileId, Vec<LayerId>>,
-    buckets_by_layer: HashMap<(TileId, LayerId), Vec<usize>>,
+    buckets_by_layer: HashMap<(TileId, LayerId), Vec<ShapeIndex>>,
 }
 
 /// 为超大 shape 预先切出来的 tile 局部世界坐标碎片。
@@ -246,7 +254,7 @@ pub struct PreparedTileFragment {
 pub struct PreparedTileFragments {
     pub per_tile_layer: HashMap<(TileId, LayerId), Vec<PreparedTileFragment>>,
     pub tile_layers: HashMap<TileId, Vec<LayerId>>,
-    pub shape_indices: HashSet<usize>,
+    pub shape_indices: HashSet<ShapeIndex>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,9 +416,10 @@ impl ShapeSpatialIndex {
         let rows = grid_side;
         let cell_width = (scene_bounds.width().max(1.0) / cols as f32).max(1.0);
         let cell_height = (scene_bounds.height().max(1.0) / rows as f32).max(1.0);
-        let mut buckets: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let mut buckets: HashMap<(i32, i32), Vec<ShapeIndex>> = HashMap::new();
 
         for (index, shape) in scene.shapes().iter().enumerate() {
+            let shape_index = encode_shape_index(index);
             let min_col = cell_for(shape.bounds.min_x, scene_bounds.min_x, cell_width, cols);
             let max_col = cell_for(shape.bounds.max_x, scene_bounds.min_x, cell_width, cols);
             let min_row = cell_for(shape.bounds.min_y, scene_bounds.min_y, cell_height, rows);
@@ -418,7 +427,7 @@ impl ShapeSpatialIndex {
 
             for col in min_col..=max_col {
                 for row in min_row..=max_row {
-                    buckets.entry((col, row)).or_default().push(index);
+                    buckets.entry((col, row)).or_default().push(shape_index);
                 }
             }
         }
@@ -449,11 +458,11 @@ impl TileGridIndex {
         let rows = cols;
         let tile_width = (scene_bounds.width().max(1.0) / cols as f32).max(1.0);
         let tile_height = (scene_bounds.height().max(1.0) / rows as f32).max(1.0);
-        let mut buckets: HashMap<TileId, Vec<usize>> = HashMap::new();
         let mut tile_layers_seen: HashMap<TileId, BTreeSet<LayerId>> = HashMap::new();
-        let mut buckets_by_layer: HashMap<(TileId, LayerId), Vec<usize>> = HashMap::new();
+        let mut buckets_by_layer: HashMap<(TileId, LayerId), Vec<ShapeIndex>> = HashMap::new();
 
         for (index, shape) in scene.shapes().iter().enumerate() {
+            let shape_index = encode_shape_index(index);
             let min_col = cell_for(shape.bounds.min_x, scene_bounds.min_x, tile_width, cols);
             let max_col = cell_for(shape.bounds.max_x, scene_bounds.min_x, tile_width, cols);
             let min_row = cell_for(shape.bounds.min_y, scene_bounds.min_y, tile_height, rows);
@@ -462,11 +471,10 @@ impl TileGridIndex {
             for col in min_col..=max_col {
                 for row in min_row..=max_row {
                     let tile_id = TileId { col, row };
-                    buckets.entry(tile_id).or_default().push(index);
                     buckets_by_layer
                         .entry((tile_id, shape.layer))
                         .or_default()
-                        .push(index);
+                        .push(shape_index);
                     tile_layers_seen
                         .entry(tile_id)
                         .or_default()
@@ -481,7 +489,6 @@ impl TileGridIndex {
             tile_height,
             cols,
             rows,
-            buckets,
             tile_layers: tile_layers_seen
                 .into_iter()
                 .map(|(tile_id, layers)| (tile_id, layers.into_iter().collect()))
@@ -495,11 +502,6 @@ impl TileGridIndex {
         self.cols.max(self.rows) as u32
     }
 
-    /// 取出一个 tile 内可能出现的 shape 索引集合。
-    pub fn shape_indices_for_tile(&self, tile_id: TileId) -> &[usize] {
-        self.buckets.get(&tile_id).map(Vec::as_slice).unwrap_or(&[])
-    }
-
     /// 取出一个 tile 下出现过哪些 layer。
     pub fn layers_for_tile(&self, tile_id: TileId) -> &[LayerId] {
         self.tile_layers
@@ -511,7 +513,7 @@ impl TileGridIndex {
     /// 直接取出某个 `tile + layer` 对应的 shape 索引集合。
     ///
     /// 这是把"按 tile 扫 shape 再现场分层"这一步提前搬到了索引构建阶段。
-    pub fn shape_indices_for_tile_layer(&self, tile_id: TileId, layer: LayerId) -> &[usize] {
+    pub fn shape_indices_for_tile_layer(&self, tile_id: TileId, layer: LayerId) -> &[ShapeIndex] {
         self.buckets_by_layer
             .get(&(tile_id, layer))
             .map(Vec::as_slice)
@@ -552,7 +554,7 @@ impl TileGridIndex {
         for col in min_col..=max_col {
             for row in min_row..=max_row {
                 let tile_id = TileId { col, row };
-                if self.buckets.contains_key(&tile_id) {
+                if self.tile_layers.contains_key(&tile_id) {
                     tiles.push(tile_id);
                 }
             }
@@ -631,11 +633,11 @@ pub fn query_visible_shapes(
                     // 同一个 shape 可能跨多个 bucket，所以要去重。
                     if seen.insert(shape_index) {
                         candidate_shapes += 1;
-                        if scene.shapes()[shape_index]
+                        if scene.shapes()[shape_index as usize]
                             .bounds
                             .intersects(visible_world_bounds)
                         {
-                            indices.push(shape_index);
+                            indices.push(shape_index as usize);
                         }
                     }
                 }
@@ -694,7 +696,7 @@ pub fn query_visible_tiles(index: &TileGridIndex, visible_world_bounds: Bounds) 
     for col in min_col..=max_col {
         for row in min_row..=max_row {
             let tile_id = TileId { col, row };
-            if index.buckets.contains_key(&tile_id) {
+            if index.tile_layers.contains_key(&tile_id) {
                 tiles.push(tile_id);
             }
         }
@@ -737,7 +739,8 @@ pub fn prepare_large_shape_tile_fragments_with_budget(
     let mut prepared_fragment_budget_used = 0usize;
     let mut prepared_point_budget_used = 0usize;
 
-    for (shape_index, shape) in scene.shapes().iter().enumerate() {
+    for (shape_index_raw, shape) in scene.shapes().iter().enumerate() {
+        let shape_index = encode_shape_index(shape_index_raw);
         let tile_ids = tile_grid.tile_ids_for_bounds(shape.bounds);
         if tile_ids.len() < min_tile_span {
             continue;
@@ -1273,6 +1276,21 @@ fn emit_scaled_shape_vertices(
         }
         let outline_points = normalized_closed_points(&outline_points);
         let fill_points = normalized_closed_points(&fill_points);
+        if let Some(marker_center) = tiny_shape_marker_center(&outline_points) {
+            emit_tiny_closed_shape_marker(
+                vertices,
+                marker_center,
+                outline_color,
+                fill_color(layer),
+                effective_mode,
+                hatch_style,
+            );
+            return;
+        }
+        let suppress_fill = matches!(
+            effective_mode,
+            ClosedShapeDrawMode::Hatch | ClosedShapeDrawMode::HatchOutline
+        ) && should_suppress_fill_for_small_closed_shape(&outline_points);
         let coarse_lod_points = if should_use_coarse_closed_shape_lod(&fill_points) {
             coarse_closed_shape_points(&fill_points)
         } else if should_use_coarse_closed_shape_lod(&outline_points) {
@@ -1298,14 +1316,54 @@ fn emit_scaled_shape_vertices(
                 }
             }
             ClosedShapeDrawMode::Hatch => {
-                if let Some(coarse_points) = coarse_lod_points.as_ref() {
+                if suppress_fill {
+                    if let Some(coarse_points) = coarse_lod_points.as_ref() {
+                        emit_outline_segments(vertices, coarse_points, true, width, outline_color);
+                    } else if let Some(tile_bounds) = scaled_tile_bounds {
+                        emit_clipped_closed_outline_segments(
+                            vertices,
+                            &outline_points,
+                            tile_bounds,
+                            width,
+                            outline_color,
+                        );
+                    } else if outline_points.len() >= 3 {
+                        emit_outline_segments(
+                            vertices,
+                            &outline_points,
+                            true,
+                            width,
+                            outline_color,
+                        );
+                    }
+                } else if let Some(coarse_points) = coarse_lod_points.as_ref() {
                     emit_polygon_fill(vertices, coarse_points, fill_color(layer), hatch_style);
                 } else if fill_points.len() >= 3 {
                     emit_polygon_fill(vertices, &fill_points, fill_color(layer), hatch_style);
                 }
             }
             ClosedShapeDrawMode::HatchOutline => {
-                if let Some(coarse_points) = coarse_lod_points.as_ref() {
+                if suppress_fill {
+                    if let Some(coarse_points) = coarse_lod_points.as_ref() {
+                        emit_outline_segments(vertices, coarse_points, true, width, outline_color);
+                    } else if let Some(tile_bounds) = scaled_tile_bounds {
+                        emit_clipped_closed_outline_segments(
+                            vertices,
+                            &outline_points,
+                            tile_bounds,
+                            width,
+                            outline_color,
+                        );
+                    } else if outline_points.len() >= 3 {
+                        emit_outline_segments(
+                            vertices,
+                            &outline_points,
+                            true,
+                            width,
+                            outline_color,
+                        );
+                    }
+                } else if let Some(coarse_points) = coarse_lod_points.as_ref() {
                     emit_polygon_fill(vertices, coarse_points, fill_color(layer), hatch_style);
                     emit_outline_segments(vertices, coarse_points, true, width, outline_color);
                 } else {
@@ -1339,6 +1397,16 @@ fn emit_scaled_shape_vertices(
             .map(|point| scaled_world_to_screen(point, zoom))
             .collect();
         if points.len() < 2 {
+            return;
+        }
+        if let Some(marker_segment) = tiny_open_shape_marker_segment(&points) {
+            emit_segment(
+                vertices,
+                marker_segment[0],
+                marker_segment[1],
+                width,
+                outline_color,
+            );
             return;
         }
         let coarse_points = coarse_open_polyline_points(&points);
@@ -1375,6 +1443,33 @@ fn should_use_coarse_closed_shape_lod(points: &[Vec2]) -> bool {
         return false;
     };
     bounds.width().max(bounds.height()) <= CLOSED_SHAPE_LOD_MAX_SCREEN_EXTENT
+}
+
+fn tiny_shape_marker_center(points: &[Vec2]) -> Option<Vec2> {
+    let bounds = screen_bounds_from_points(points)?;
+    if bounds.width().max(bounds.height()) > TINY_SHAPE_MARKER_MAX_SCREEN_EXTENT {
+        return None;
+    }
+    Some(Vec2::new(
+        (bounds.min_x + bounds.max_x) * 0.5,
+        (bounds.min_y + bounds.max_y) * 0.5,
+    ))
+}
+
+fn tiny_open_shape_marker_segment(points: &[Vec2]) -> Option<[Vec2; 2]> {
+    let center = tiny_shape_marker_center(points)?;
+    let half_extent = TINY_SHAPE_MARKER_SCREEN_SIZE * 0.5;
+    Some([
+        center + Vec2::new(-half_extent, 0.0),
+        center + Vec2::new(half_extent, 0.0),
+    ])
+}
+
+fn should_suppress_fill_for_small_closed_shape(points: &[Vec2]) -> bool {
+    let Some(bounds) = screen_bounds_from_points(points) else {
+        return false;
+    };
+    bounds.width().max(bounds.height()) <= SMALL_CLOSED_SHAPE_OUTLINE_ONLY_MAX_SCREEN_EXTENT
 }
 
 fn coarse_closed_shape_target_points(points: &[Vec2]) -> Option<usize> {
@@ -1580,6 +1675,21 @@ fn emit_scaled_prepared_closed_fragment_vertices(
         .map(|point| scaled_world_to_screen(point, zoom))
         .collect();
     let fill_points = normalized_closed_points(&fill_points);
+    if let Some(marker_center) = tiny_shape_marker_center(&fill_points) {
+        emit_tiny_closed_shape_marker(
+            vertices,
+            marker_center,
+            outline_color,
+            fill_color(fragment.layer),
+            effective_mode,
+            hatch_style,
+        );
+        return;
+    }
+    let suppress_fill = matches!(
+        effective_mode,
+        ClosedShapeDrawMode::Hatch | ClosedShapeDrawMode::HatchOutline
+    ) && should_suppress_fill_for_small_closed_shape(&fill_points);
     let coarse_lod_points = should_use_coarse_closed_shape_lod(&fill_points)
         .then(|| coarse_closed_shape_points(&fill_points))
         .flatten();
@@ -1599,7 +1709,19 @@ fn emit_scaled_prepared_closed_fragment_vertices(
             }
         }
         ClosedShapeDrawMode::Hatch => {
-            if let Some(coarse_points) = coarse_lod_points.as_ref() {
+            if suppress_fill {
+                if let Some(coarse_points) = coarse_lod_points.as_ref() {
+                    emit_outline_segments(vertices, coarse_points, true, width, outline_color);
+                } else {
+                    emit_scaled_outline_segment_pairs(
+                        vertices,
+                        &fragment.outline_segments,
+                        zoom,
+                        width,
+                        outline_color,
+                    );
+                }
+            } else if let Some(coarse_points) = coarse_lod_points.as_ref() {
                 emit_polygon_fill(
                     vertices,
                     coarse_points,
@@ -1616,7 +1738,19 @@ fn emit_scaled_prepared_closed_fragment_vertices(
             }
         }
         ClosedShapeDrawMode::HatchOutline => {
-            if let Some(coarse_points) = coarse_lod_points.as_ref() {
+            if suppress_fill {
+                if let Some(coarse_points) = coarse_lod_points.as_ref() {
+                    emit_outline_segments(vertices, coarse_points, true, width, outline_color);
+                } else {
+                    emit_scaled_outline_segment_pairs(
+                        vertices,
+                        &fragment.outline_segments,
+                        zoom,
+                        width,
+                        outline_color,
+                    );
+                }
+            } else if let Some(coarse_points) = coarse_lod_points.as_ref() {
                 emit_polygon_fill(
                     vertices,
                     coarse_points,
@@ -1641,6 +1775,32 @@ fn emit_scaled_prepared_closed_fragment_vertices(
                     outline_color,
                 );
             }
+        }
+    }
+}
+
+fn emit_tiny_closed_shape_marker(
+    vertices: &mut Vec<LineVertex>,
+    center: Vec2,
+    outline_color: [f32; 4],
+    fill_color_value: [f32; 4],
+    effective_mode: ClosedShapeDrawMode,
+    hatch_style: HatchStylePreset,
+) {
+    let half_extent = TINY_SHAPE_MARKER_SCREEN_SIZE * 0.5;
+    let corners = [
+        center + Vec2::new(-half_extent, -half_extent),
+        center + Vec2::new(half_extent, -half_extent),
+        center + Vec2::new(half_extent, half_extent),
+        center + Vec2::new(-half_extent, half_extent),
+    ];
+
+    match effective_mode {
+        ClosedShapeDrawMode::Outline => {
+            emit_outline_segments(vertices, &corners, true, 1.0, outline_color);
+        }
+        ClosedShapeDrawMode::Hatch | ClosedShapeDrawMode::HatchOutline => {
+            emit_polygon_fill(vertices, &corners, fill_color_value, hatch_style);
         }
     }
 }

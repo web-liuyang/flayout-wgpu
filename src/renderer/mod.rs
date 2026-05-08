@@ -231,10 +231,14 @@ struct PendingTileBuild {
 /// 以及第二层合批后的 GPU buffer；那样会显著放大内存占用，
 /// 但对实际卡顿改善并不明显。
 struct TileCacheEntry {
-    vertex_buffer: wgpu::Buffer,
-    vertex_count: u32,
+    vertex_buffers: Vec<TileCacheBufferSegment>,
     byte_size: usize,
     last_used_tick: u64,
+}
+
+struct TileCacheBufferSegment {
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
 }
 
 /// 默认 tile cache 条目上限。
@@ -909,8 +913,10 @@ impl Renderer {
                             tile_scissor.width,
                             tile_scissor.height,
                         );
-                        render_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
-                        render_pass.draw(0..entry.vertex_count, 0..1);
+                        for segment in &entry.vertex_buffers {
+                            render_pass.set_vertex_buffer(0, segment.vertex_buffer.slice(..));
+                            render_pass.draw(0..segment.vertex_count, 0..1);
+                        }
                     }
                 }
             }
@@ -1226,7 +1232,11 @@ impl Renderer {
                     if counts_towards_active_budget {
                         active_layer_visible_count += 1;
                     }
-                    total_vertices += entry.vertex_count as usize;
+                    total_vertices += entry
+                        .vertex_buffers
+                        .iter()
+                        .map(|segment| segment.vertex_count as usize)
+                        .sum::<usize>();
                     visible_tile_keys.push(tile_key);
                 }
             } else {
@@ -1418,12 +1428,12 @@ impl Renderer {
             .tile_grid
             .shape_indices_for_tile_layer(tile_key.tile_id, tile_key.layer)
             .iter()
-            .copied()
+            .map(|shape_index| *shape_index as usize)
             .filter(|shape_index| {
                 !self
                     .prepared_tile_fragments
                     .shape_indices
-                    .contains(shape_index)
+                    .contains(&(*shape_index as u32))
             })
             .collect();
         let empty_hidden_layers = BTreeSet::new();
@@ -1556,16 +1566,37 @@ fn create_tile_cache_entry(
     vertices: &[LineVertex],
     last_used_tick: u64,
 ) -> Option<TileCacheEntry> {
-    (!vertices.is_empty()).then(|| TileCacheEntry {
-        vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tile-layer-vertex-buffer"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        }),
-        vertex_count: vertices.len() as u32,
+    if vertices.is_empty() {
+        return None;
+    }
+
+    let max_buffer_size = device.limits().max_buffer_size as usize;
+    let max_vertices_per_buffer =
+        max_vertices_per_buffer_for_limit(max_buffer_size, std::mem::size_of::<LineVertex>());
+    let mut vertex_buffers = Vec::new();
+
+    for chunk in vertices.chunks(max_vertices_per_buffer) {
+        vertex_buffers.push(TileCacheBufferSegment {
+            vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tile-layer-vertex-buffer"),
+                contents: bytemuck::cast_slice(chunk),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+            vertex_count: chunk.len() as u32,
+        });
+    }
+
+    Some(TileCacheEntry {
+        vertex_buffers,
         byte_size: std::mem::size_of_val(vertices),
         last_used_tick,
     })
+}
+
+fn max_vertices_per_buffer_for_limit(max_buffer_size: usize, vertex_size: usize) -> usize {
+    let max_vertices = max_buffer_size / vertex_size;
+    let triangle_aligned = max_vertices - (max_vertices % 3);
+    triangle_aligned.max(3)
 }
 
 fn should_freeze_interaction_view(interaction_degraded: bool, has_stable_view: bool) -> bool {
@@ -2012,8 +2043,8 @@ mod tests {
         RenderDebugStats, TileCacheKey, active_layer_pending_count, advance_active_display_budget,
         compute_effective_build_budget, compute_revealed_layers_for_display,
         effective_build_budget_for_active_layer, enqueue_unique_pending,
-        merge_requested_tile_keys_for_incremental_pan, next_active_progressive_layer,
-        pop_next_pending_for_layer, refresh_progressive_queue,
+        max_vertices_per_buffer_for_limit, merge_requested_tile_keys_for_incremental_pan,
+        next_active_progressive_layer, pop_next_pending_for_layer, refresh_progressive_queue,
         refresh_progressive_queue_incremental, requested_layers_in_order,
         select_tile_eviction_victims, should_bypass_progressive_for_layer,
         should_display_cached_tile_key, should_freeze_interaction_view,
@@ -2332,6 +2363,16 @@ mod tests {
         assert!(should_freeze_interaction_view(true, true));
         assert!(!should_freeze_interaction_view(true, false));
         assert!(!should_freeze_interaction_view(false, true));
+    }
+
+    #[test]
+    fn max_vertices_per_buffer_respects_limit_and_triangle_alignment() {
+        let vertex_size = std::mem::size_of::<super::LineVertex>();
+        let max_vertices = max_vertices_per_buffer_for_limit(vertex_size * 10 + 1, vertex_size);
+
+        assert_eq!(max_vertices, 9);
+        assert!(max_vertices * vertex_size <= vertex_size * 10 + 1);
+        assert_eq!(max_vertices % 3, 0);
     }
 
     #[test]

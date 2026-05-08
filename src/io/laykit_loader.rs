@@ -1193,7 +1193,7 @@ fn push_outline_shape(
         layer,
         hierarchy_level,
         bounds,
-        points,
+        points: points.into(),
         closed,
         stroke_width_world,
     });
