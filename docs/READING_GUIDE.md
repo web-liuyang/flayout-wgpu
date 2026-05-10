@@ -30,6 +30,7 @@
 20. `docs/SHAPE_TO_PIXEL_GUIDE.md`
 21. `docs/SOURCE_INDEX.md`
 22. `docs/TEST_WALKTHROUGH.md`
+23. `docs/performance-tuning.md`
 
 ## 为什么这样看
 
@@ -122,6 +123,12 @@
 - 为什么 tile 顶点只做缩放，不做平移
 - 为什么平移要放到 shader uniform 里
 - `cached_scene_key` 和 `tile_cache_domain` 分别是在保护什么
+
+如果你已经准备开始自己调参数，再接着读：
+
+- `docs/performance-tuning.md`
+
+它更偏“实战调参地图”，不是源码导读。
 
 ## 这个 demo 当前的数据流
 

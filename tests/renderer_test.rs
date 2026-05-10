@@ -1540,6 +1540,15 @@ fn denser_tile_grid_splits_visible_region_into_more_tiles() {
     assert!(dense_tiles.len() > coarse_tiles.len());
 }
 
+#[test]
+fn bounds_only_tile_grid_still_reports_visible_tiles() {
+    let grid = TileGridIndex::build_for_bounds(Bounds::new(0.0, 0.0, 100.0, 100.0), 4);
+
+    let tiles = query_visible_tiles(&grid, Bounds::new(10.0, 10.0, 40.0, 40.0));
+
+    assert!(!tiles.is_empty());
+}
+
 fn polygon_area(points: &[Vec2]) -> f32 {
     let mut area = 0.0;
     for index in 0..points.len() {

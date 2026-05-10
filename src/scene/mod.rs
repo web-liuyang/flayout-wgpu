@@ -15,11 +15,14 @@ use glam::Vec2;
 
 #[derive(Debug, Clone)]
 pub enum ShapePoints {
+    /// 高频矩形直接内联四个角点，避免额外堆分配。
     InlineRect([Vec2; 4]),
+    /// 其他更一般的点列仍然走堆分配。
     Heap(Vec<Vec2>),
 }
 
 impl ShapePoints {
+    /// 这个点列当前是否走了“内联四点矩形”优化。
     pub fn is_inline(&self) -> bool {
         matches!(self, Self::InlineRect(_))
     }
@@ -54,9 +57,13 @@ impl Deref for ShapePoints {
 /// - 空间索引
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds {
+    /// 左下角 x。
     pub min_x: f32,
+    /// 左下角 y。
     pub min_y: f32,
+    /// 右上角 x。
     pub max_x: f32,
+    /// 右上角 y。
     pub max_y: f32,
 }
 
@@ -66,7 +73,9 @@ pub struct Bounds {
 /// 所以这里把它们绑定成一个排序友好的键。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LayerId {
+    /// 工艺层号。
     pub layer: u32,
+    /// layer 下的 datatype。
     pub datatype: u32,
 }
 
@@ -80,7 +89,9 @@ pub struct LayerId {
 /// 每层单独颜色、单独 hatch 样式，也可以继续往这个方向长。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LayerDisplayOverride<T> {
+    /// 被覆盖显示策略的 layer。
     pub layer: LayerId,
+    /// 对应 layer 的覆盖值。
     pub value: T,
 }
 
@@ -128,18 +139,21 @@ pub struct RectShape {
 /// 场景统计信息。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneStats {
+    /// 当前扁平 scene 中 shape 的总数。
     pub shape_count: usize,
 }
 
 /// 一个具体可渲染的场景。
 #[derive(Debug, Clone, Default)]
 pub struct Scene {
+    /// 当前场景里真正可渲染的扁平 shape 列表。
     shapes: Vec<RectShape>,
 }
 
 /// 一个可切换的视图项，通常对应一个 root cell。
 #[derive(Debug, Clone)]
 pub struct SceneView {
+    /// 这个可切换视图在 UI 中展示的名字，通常对应 root cell 名。
     pub name: String,
     /// 这里用 `Arc<Scene>`，避免 bundle / app / renderer 之间为同一个 root cell
     /// 重复拷贝整份几何数据。
@@ -151,7 +165,9 @@ pub struct SceneView {
 /// 多个 root cell 时，UI 用它来切换当前显示的 cell。
 #[derive(Debug, Clone, Default)]
 pub struct SceneBundle {
+    /// 用户可切换的根视图集合。
     views: Vec<SceneView>,
+    /// 当前选中的视图下标。
     selected: usize,
 }
 

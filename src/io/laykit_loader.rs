@@ -60,9 +60,13 @@ struct Transform2D {
 /// 等所有 structure 都扫完之后，再统一补全实例 footprint。
 #[derive(Debug, Clone)]
 struct RawGdsCell {
+    /// 这个 structure 在内部 `LayoutBundle` 里的稳定 cell id。
     id: LayoutCellId,
+    /// 原始 GDS structure 名称。
     name: String,
+    /// 该 structure 直接拥有的本地图形，不含 child 展开结果。
     local_shapes: Vec<LayoutShape>,
+    /// 该 structure 直接拥有的本地实例引用，不含递归子树。
     local_instances: Vec<RawGdsInstance>,
 }
 
@@ -72,9 +76,15 @@ struct RawGdsCell {
 /// 还不一定已经拿到了目标 cell 的 bounds。
 #[derive(Debug, Clone)]
 struct RawGdsInstance {
+    /// 被引用目标 cell 的稳定 id。
     target_cell_id: LayoutCellId,
+    /// 目标 cell 名称。
+    ///
+    /// 这里保留名字是为了在第一遍扫描结束前，仍然能延迟解析目标 bounds。
     target_name: String,
+    /// 单个实例模板本身的局部放置变换。
     transform: LayoutTransform,
+    /// 阵列语义；普通 `StructRef` 为 `None`，`ArrayRef` 则保留规则阵列参数。
     repetition: Option<LayoutRepetition>,
 }
 
@@ -258,6 +268,8 @@ fn build_gds_scene_bundle(gds: &GDSIIFile) -> Result<SceneBundle, AppError> {
 /// - 本地 `Boundary / Box / Path` 保留为 `LayoutShape`
 /// - `StructRef / ArrayRef` 保留为 `LayoutInstance`
 fn build_gds_layout_bundle(gds: &GDSIIFile) -> Result<LayoutBundle, AppError> {
+    // 这里先为每个 structure 分配稳定 id，
+    // 这样后面组装 `LayoutInstance` 时就不必依赖字符串查找作为长期主键。
     let cell_ids: HashMap<&str, LayoutCellId> = gds
         .structures
         .iter()
@@ -282,6 +294,8 @@ fn build_gds_layout_bundle(gds: &GDSIIFile) -> Result<LayoutBundle, AppError> {
         })
         .collect::<Result<_, AppError>>()?;
 
+    // 第二遍递归补齐每个 raw cell 的整体 footprint。
+    // 这样 app / renderer 后面就能直接用 cell bounds 做裁剪、fit、层级 LOD。
     let mut bounds_cache = HashMap::new();
     for structure in &gds.structures {
         let mut stack = vec![structure.name.as_str()];
@@ -358,6 +372,8 @@ fn build_oasis_scene_bundle(oasis: &OASISFile) -> Result<SceneBundle, AppError> 
         .iter()
         .filter(|cell| !referenced.contains(cell.name.as_str()))
         .collect();
+    // OASIS 和 GDS 一样，优先只把“未被引用的 cells”暴露给 UI。
+    // 如果一个文件所有 cell 都彼此引用，再回退成“全部可选”。
     let source_cells = if root_cells.is_empty() {
         oasis.cells.iter().collect()
     } else {
@@ -657,6 +673,8 @@ fn raw_instance_to_layout_instance(
 
 /// 计算一个 raw instance 在父 cell 局部坐标中的完整 footprint。
 fn raw_instance_bounds(instance: &RawGdsInstance, target_bounds: Option<Bounds>) -> Option<Bounds> {
+    // 先把“单个实例模板”的 bounds 放到父坐标系里，
+    // 再在阵列情况下把每个 repetition 副本 union 起来。
     let base_bounds = target_bounds.map(|bounds| transform_bounds(bounds, instance.transform));
     match instance.repetition.as_ref() {
         Some(LayoutRepetition::RegularGrid {
@@ -709,6 +727,8 @@ fn layout_transform_from_gds_reference(origin: Vec2, strans: Option<&STrans>) ->
 fn array_ref_column_step(aref: &ArrayRef, origin: Vec2, columns: u32) -> Vec2 {
     if aref.xy.len() >= 2 && columns > 1 {
         let array_col_vector = Vec2::new(aref.xy[1].0 as f32, aref.xy[1].1 as f32) - origin;
+        // GDS AREF 的第二个点代表“参考点 + 列步长 * 列数”，
+        // 不是最后一列实例本身的中心点。
         array_col_vector / columns as f32
     } else {
         Vec2::ZERO
@@ -719,6 +739,7 @@ fn array_ref_column_step(aref: &ArrayRef, origin: Vec2, columns: u32) -> Vec2 {
 fn array_ref_row_step(aref: &ArrayRef, origin: Vec2, rows: u32) -> Vec2 {
     if aref.xy.len() >= 3 && rows > 1 {
         let array_row_vector = Vec2::new(aref.xy[2].0 as f32, aref.xy[2].1 as f32) - origin;
+        // 第三个点同理，表示“参考点 + 行步长 * 行数”。
         array_row_vector / rows as f32
     } else {
         Vec2::ZERO
@@ -727,6 +748,8 @@ fn array_ref_row_step(aref: &ArrayRef, origin: Vec2, rows: u32) -> Vec2 {
 
 /// 把一个局部 bounds 经过实例变换后，变成父坐标系下的 bounds。
 fn transform_bounds(bounds: Bounds, transform: LayoutTransform) -> Bounds {
+    // bounds 经过旋转/镜像后不再和原始轴对齐，
+    // 所以这里通过四个角点显式变换，再重新包一层 AABB。
     let affine = Transform2D::from_gds_reference(
         transform.translation,
         Some(&STrans {
@@ -811,6 +834,8 @@ fn collect_oasis_shapes(
     stack: &mut Vec<String>,
     shapes: &mut Vec<RectShape>,
 ) -> Result<(), AppError> {
+    // OASIS 目前仍走“递归扁平化成 Scene”的旧路径，
+    // 这样能复用 renderer，并给后续层次化 OASIS 支持保留验证基线。
     for element in &cell.elements {
         match element {
             OASISElement::Rectangle(rectangle) => {
@@ -1261,6 +1286,8 @@ fn repetition_offsets(repetition: Option<&Repetition>) -> Result<Vec<Vec2>, AppE
             x_displacements,
             y_displacements,
         } => {
+            // `laykit` 这里给的是位移列表，不要求 x/y 长度完全一致；
+            // 缺项时回退成 0，保持“尽可能读出能读的实例”。
             let len = x_displacements.len().max(y_displacements.len()).max(1);
             let mut offsets = Vec::with_capacity(len);
             for index in 0..len {
@@ -1328,6 +1355,8 @@ fn array_ref_offsets(aref: &ArrayRef) -> Vec<Vec2> {
 
 /// 从浮点点集生成 bounds。
 fn bounds_from_points(points: &[Vec2]) -> Option<Bounds> {
+    // 这里保持实现极简，因为 loader 只需要稳定、可读的 AABB，
+    // 不需要额外引入几何库或复杂数值策略。
     let first = *points.first()?;
     let mut min_x = first.x;
     let mut min_y = first.y;

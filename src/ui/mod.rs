@@ -87,6 +87,8 @@ pub fn draw_ui(
     load_state: &LoadState,
     scene_bundle: &SceneBundle,
     scene: &Scene,
+    scene_layers: &[LayerId],
+    scene_bounds_hint: Option<crate::scene::Bounds>,
     full_scene_max_hierarchy_level: u32,
     camera: &Camera2D,
     hidden_layers: &BTreeSet<LayerId>,
@@ -237,7 +239,7 @@ pub fn draw_ui(
                     // 这里保留两层滚动：
                     // 1. 整个左栏可以整体滚动，解决面板内容总高度过高的问题
                     // 2. `Layers` 自己仍然有局部滚动，避免 layer 特别多时独占整栏高度
-                    let layers = scene.layer_ids();
+                    let layers = scene_layers.to_vec();
                     if !layers.is_empty() {
                         ui.separator();
                         ui.label("Layers");
@@ -385,6 +387,8 @@ pub fn draw_ui(
 
                     ui.separator();
                     ui.label("Performance");
+                    // 这里显示的是滑动窗口平均 FPS，而不是某一帧的瞬时值。
+                    // 这样做虽然不适合精确 benchmark，但更适合日常看交互体感趋势。
                     ui.label(format!("FPS: {:.1}", frame_stats.fps()));
                     ui.label(format!("Frame: {:.2} ms", frame_stats.frame_time_ms()));
 
@@ -402,6 +406,9 @@ pub fn draw_ui(
                         render_debug_stats.visible_shapes
                     ));
                     ui.label(format!("Bucket hits: {}", render_debug_stats.bucket_hits));
+                    // `Vertices` 和 `Draw calls` 是当前最值得一起看的一对：
+                    // - Vertices 高：更像几何量 / hatch / LOD 问题
+                    // - Draw calls 高：更像 tile 粒度 / batching / state churn 问题
                     ui.label(format!("Vertices: {}", render_debug_stats.vertex_count));
                     ui.label(format!("Draw calls: {}", render_debug_stats.draw_calls));
                     egui::ComboBox::from_id_salt("draw-mode-combo")
@@ -552,6 +559,8 @@ pub fn draw_ui(
                             "miss"
                         }
                     ));
+                    // 这里的 `Cache hit/miss` 指的是“这一帧 scene/tile 调度是否稳定”，
+                    // 不是传统意义上某一个 CPU L1/L2 cache 的命中率。
                     ui.label(format!(
                         "Cache entries: {} / {}",
                         render_debug_stats.cache_entries, render_debug_stats.cache_capacity
@@ -577,6 +586,10 @@ pub fn draw_ui(
                         "Pending entries: {}",
                         render_debug_stats.pending_entries
                     ));
+                    // `Pending entries` 和 `Build budget` 一起看时很有用：
+                    // - pending 一直很高：说明当前视图还在追赶
+                    // - budget 很小：说明我们更偏交互友好
+                    // - budget 很大但 pending 仍然很高：更像单任务本身太重
                     ui.label(format!("Build budget: {}", render_debug_stats.build_budget));
                     ui.label(format!(
                         "Progressive mode: {}",
@@ -622,6 +635,8 @@ pub fn draw_ui(
 
                     ui.separator();
                     ui.label("Trends");
+                    // 趋势图的意义不是给出“绝对正确的 profiler 数据”，
+                    // 而是帮助观察某次优化后，几何量 / miss / cache / pending 的方向有没有变。
                     draw_metric_history(
                         ui,
                         "Vertices",
@@ -663,7 +678,7 @@ pub fn draw_ui(
                     ui.separator();
                     let stats = scene.stats();
                     ui.label(format!("Shape count: {}", stats.shape_count));
-                    if let Some(bounds) = scene.bounds() {
+                    if let Some(bounds) = scene_bounds_hint.or_else(|| scene.bounds()) {
                         ui.label(format!(
                             "Bounds: [{:.1}, {:.1}] - [{:.1}, {:.1}]",
                             bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y
@@ -746,6 +761,7 @@ pub fn draw_ui(
     action
 }
 
+/// 把内部闭合图元显示模式映射成 UI 下拉框标签。
 fn closed_shape_draw_mode_label(mode: ClosedShapeDrawMode) -> &'static str {
     match mode {
         ClosedShapeDrawMode::Outline => "Outline",
@@ -754,6 +770,10 @@ fn closed_shape_draw_mode_label(mode: ClosedShapeDrawMode) -> &'static str {
     }
 }
 
+/// 把 hatch 预设映射成用户更容易快速辨认的文本标签。
+///
+/// 这里故意保留了方向示意符号，方便用户在不记名字的情况下，
+/// 也能直接从下拉框里猜到大概的线条方向。
 fn hatch_style_label(style: HatchStylePreset) -> &'static str {
     match style {
         HatchStylePreset::LeftDiagonal => r"LeftDiag (\)",
@@ -777,6 +797,8 @@ fn draw_metric_history(
     color: Color32,
     formatter: impl Fn(f32) -> String,
 ) {
+    // 每个趋势图先展示“当前值 + 窗口最大值”，
+    // 让用户即使不细看折线，也能先判断当前量级与最近峰值。
     ui.label(format!(
         "{label}: {} (max {})",
         formatter(history.latest()),
@@ -796,6 +818,7 @@ fn draw_metric_history(
 
     let samples = history.samples();
     if samples.len() < 2 {
+        // 单样本没有趋势可言，保留底板和文本即可。
         return;
     }
 
@@ -841,6 +864,10 @@ fn draw_metric_history(
     let _ = (width, height);
 }
 
+/// 把字节数压成适合侧栏趋势图显示的紧凑文本。
+///
+/// 这里优先追求“快速读量级”，而不是严格区分所有单位命名，
+/// 因为它服务的是调试面板，而不是导出报表。
 fn format_bytes_compact(value: f32) -> String {
     if value >= 1024.0 * 1024.0 {
         format!("{:.2} MB", value / (1024.0 * 1024.0))

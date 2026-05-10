@@ -41,7 +41,9 @@ pub struct FrameStats {
 /// - 让 UI 可以随时拿到一条 sparkline 所需的数据
 #[derive(Debug, Clone)]
 pub struct MetricHistory {
+    /// 固定窗口里的样本队列。
     samples: VecDeque<f32>,
+    /// 窗口允许保留的最大样本数。
     capacity: usize,
 }
 
@@ -55,9 +57,20 @@ pub struct MetricHistory {
 /// - `pending_entries`：看渐进式补全是否还在追赶当前视图
 #[derive(Debug, Clone)]
 pub struct RenderStatsHistory {
+    /// 当前帧真正准备提交给 GPU 的顶点量。
+    ///
+    /// 它不等于 shape 数，也不等于 draw call 数；
+    /// 更适合用来观察 LOD / hatch / clipping / 合批对几何量的影响。
     vertices: MetricHistory,
+    /// 当前帧有多少 tile 在请求时没有命中 GPU cache。
+    ///
+    /// 这个值越低，说明当前视图越稳定，或者 cache 策略越有效。
     tile_misses: MetricHistory,
+    /// tile cache 当前粗略占用的 GPU/几何缓存体积。
     cache_bytes: MetricHistory,
+    /// 当前帧结束后还有多少 `tile + layer` 任务在排队。
+    ///
+    /// 对“为什么感觉还在补图”这类问题，这个值通常比 FPS 更有解释力。
     pending_entries: MetricHistory,
 }
 
@@ -156,18 +169,22 @@ impl RenderStatsHistory {
         self.pending_entries.push(stats.pending_entries as f32);
     }
 
+    /// 顶点量历史。
     pub fn vertices(&self) -> &MetricHistory {
         &self.vertices
     }
 
+    /// tile cache miss 历史。
     pub fn tile_misses(&self) -> &MetricHistory {
         &self.tile_misses
     }
 
+    /// cache 占用字节历史。
     pub fn cache_bytes(&self) -> &MetricHistory {
         &self.cache_bytes
     }
 
+    /// pending tile build 条目历史。
     pub fn pending_entries(&self) -> &MetricHistory {
         &self.pending_entries
     }

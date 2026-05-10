@@ -38,10 +38,16 @@ pub enum PersistenceError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedLayerId {
+    /// GDS/OASIS 层号。
     pub layer: u32,
+    /// 同一层号下的 datatype。
     pub datatype: u32,
 }
 
+/// 闭合图元显示模式的持久化镜像。
+///
+/// 持久化层单独定义这份枚举，是为了让配置文件格式独立于 runtime
+/// 模块布局与实现细节。这样 renderer 将来即使重构，旧配置也更容易保持兼容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistedClosedShapeDrawMode {
@@ -50,6 +56,7 @@ pub enum PersistedClosedShapeDrawMode {
     HatchOutline,
 }
 
+/// Hatch 风格预设的持久化镜像。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistedHatchStylePreset {
@@ -61,16 +68,26 @@ pub enum PersistedHatchStylePreset {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedLayerDrawMode {
+    /// 这条覆盖配置指向的 layer。
     pub layer: PersistedLayerId,
+    /// 该 layer 恢复时应使用的闭合图元显示模式。
     pub mode: PersistedClosedShapeDrawMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedLayerHatchStyle {
+    /// 这条 hatch 预设指向的 layer。
     pub layer: PersistedLayerId,
+    /// 该 layer 恢复时应使用的 hatch 预设。
     pub style: PersistedHatchStylePreset,
 }
 
+/// 相机状态的持久化快照。
+///
+/// 这里保存的是 app / UI 层语义：
+/// - pan 仍然是世界坐标平移
+/// - zoom 仍然是相机缩放倍率
+/// 而不是 renderer 内部某一帧推导出来的矩阵。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PersistedCamera {
     pub pan_x: f32,
@@ -124,6 +141,7 @@ pub struct ViewerConfig {
 }
 
 impl PersistedLayerId {
+    /// 把 runtime 的 `LayerId` 映射到可序列化表示。
     pub fn from_runtime(layer: LayerId) -> Self {
         Self {
             layer: layer.layer,
@@ -131,6 +149,7 @@ impl PersistedLayerId {
         }
     }
 
+    /// 把配置文件里的 layer 标识还原成 runtime 类型。
     pub fn to_runtime(self) -> LayerId {
         LayerId {
             layer: self.layer,
@@ -140,6 +159,7 @@ impl PersistedLayerId {
 }
 
 impl PersistedClosedShapeDrawMode {
+    /// 从 runtime draw mode 映射到持久化语义。
     pub fn from_runtime(mode: ClosedShapeDrawMode) -> Self {
         match mode {
             ClosedShapeDrawMode::Outline => Self::Outline,
@@ -148,6 +168,7 @@ impl PersistedClosedShapeDrawMode {
         }
     }
 
+    /// 把持久化 draw mode 还原成 runtime enum。
     pub fn to_runtime(self) -> ClosedShapeDrawMode {
         match self {
             Self::Outline => ClosedShapeDrawMode::Outline,
@@ -157,15 +178,18 @@ impl PersistedClosedShapeDrawMode {
     }
 }
 
+/// 旧配置文件缺省时使用的 per-layer bypass entry 默认值。
 fn default_layer_bypass_entry_threshold() -> usize {
     8
 }
 
+/// 旧配置文件缺省时使用的 per-layer bypass work 默认值。
 fn default_layer_bypass_work_threshold() -> usize {
     128
 }
 
 impl PersistedHatchStylePreset {
+    /// 从 runtime hatch 预设映射到持久化语义。
     pub fn from_runtime(style: HatchStylePreset) -> Self {
         match style {
             HatchStylePreset::LeftDiagonal => Self::LeftDiagonal,
@@ -175,6 +199,7 @@ impl PersistedHatchStylePreset {
         }
     }
 
+    /// 把配置文件里的 hatch 预设还原成 runtime enum。
     pub fn to_runtime(self) -> HatchStylePreset {
         match self {
             Self::LeftDiagonal => HatchStylePreset::LeftDiagonal,
@@ -185,12 +210,19 @@ impl PersistedHatchStylePreset {
     }
 }
 
+/// 计算当前平台上的 viewer 配置文件路径。
+///
+/// 这里统一走 `ProjectDirs`，让不同平台都使用各自约定的配置目录，
+/// 而不是把配置散落在工作区或用户手写的固定路径里。
 pub fn viewer_config_path() -> Result<PathBuf, PersistenceError> {
     let dirs = ProjectDirs::from("com", "webliuyang", "flayout-wgpu")
         .ok_or(PersistenceError::ConfigDirUnavailable)?;
     Ok(dirs.config_dir().join("viewer-config.json"))
 }
 
+/// 从默认配置路径加载 viewer 配置。
+///
+/// 如果用户还从未保存过配置，这里返回 `Ok(None)`，而不是把文件缺失当作错误。
 pub fn load_viewer_config() -> Result<Option<ViewerConfig>, PersistenceError> {
     let path = viewer_config_path()?;
     if !path.exists() {

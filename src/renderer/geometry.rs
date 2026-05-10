@@ -80,12 +80,19 @@ const DEFAULT_VERTEX_HATCH_STYLE: f32 = 0.0;
 
 /// 当高点数闭合图形在屏幕上已经缩得很小时，
 /// 没必要继续保留全部原始轮廓点。
+///
+/// 这一组常量控制的是“图形已经展开之后”的几何 LOD，
+/// 和 app/layout 那边“子树要不要继续递归”是两层不同优化：
+/// - 上层 subtree LOD：少展开一些 shape
+/// - 这里的 shape LOD：shape 已经要画了，但少发一些点
 const CLOSED_SHAPE_LOD_MIN_POINTS: usize = 64;
 const CLOSED_SHAPE_LOD_MAX_SCREEN_EXTENT: f32 = 24.0;
 const CLOSED_SHAPE_LOD_MIN_TARGET_POINTS: usize = 8;
 const CLOSED_SHAPE_LOD_MAX_TARGET_POINTS: usize = 24;
+/// 当闭合图形已经小到肉眼几乎只剩一个点时，不再保留真实轮廓。
 const TINY_SHAPE_MARKER_MAX_SCREEN_EXTENT: f32 = 2.0;
 const TINY_SHAPE_MARKER_SCREEN_SIZE: f32 = 1.5;
+/// 中等小的闭合图形还保留外轮廓，但允许把 hatch fill 内部关掉。
 const SMALL_CLOSED_SHAPE_OUTLINE_ONLY_MAX_SCREEN_EXTENT: f32 = 12.0;
 const POLYLINE_LOD_MIN_POINTS: usize = 64;
 const POLYLINE_LOD_MAX_SCREEN_EXTENT: f32 = 24.0;
@@ -217,12 +224,19 @@ pub struct ShapeSpatialIndex {
 /// - `TileGridIndex` 更偏“把几何按 tile 分组，便于缓存复用”
 #[derive(Debug, Clone)]
 pub struct TileGridIndex {
+    /// 整个 scene 的世界坐标包围盒。
     scene_bounds: Bounds,
+    /// 单个 tile 在世界坐标里的宽度。
     tile_width: f32,
+    /// 单个 tile 在世界坐标里的高度。
     tile_height: f32,
+    /// 网格列数。
     cols: i32,
+    /// 网格行数。
     rows: i32,
+    /// 每个 tile 里实际出现过的 layer 列表。
     tile_layers: HashMap<TileId, Vec<LayerId>>,
+    /// 每个 `tile + layer` 对应的 shape 索引列表。
     buckets_by_layer: HashMap<(TileId, LayerId), Vec<ShapeIndex>>,
 }
 
@@ -235,9 +249,13 @@ pub struct TileGridIndex {
 /// - 数据结构更贴近"几何准备层"的职责
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedTileFragment {
+    /// 该 fragment 所属 layer。
     pub layer: LayerId,
+    /// fragment 的局部点列，仍然保持世界坐标。
     pub points: Vec<Vec2>,
+    /// 这个 fragment 对应的是闭合图元还是开放折线。
     pub closed: bool,
+    /// 如果它来自 path，这里保留世界坐标线宽。
     pub stroke_width_world: Option<f32>,
     /// 对闭合图形，这里保存“原始真实边裁到 tile 内之后”的线段集合。
     ///
@@ -252,14 +270,19 @@ pub struct PreparedTileFragment {
 /// renderer 后续就不需要再把它们放进"运行时 tile 裁剪"那条路径里。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PreparedTileFragments {
+    /// 每个 `tile + layer` 下对应的 fragment 列表。
     pub per_tile_layer: HashMap<(TileId, LayerId), Vec<PreparedTileFragment>>,
+    /// 每个 tile 实际出现过哪些 layer。
     pub tile_layers: HashMap<TileId, Vec<LayerId>>,
+    /// 哪些原始 shape 已经交由 prepared-fragment 路径处理。
     pub shape_indices: HashSet<ShapeIndex>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedFragmentBudget {
+    /// 允许提前准备的最大 fragment 数。
     pub max_fragments: usize,
+    /// 允许复制出的最大点数总量。
     pub max_point_copies: usize,
 }
 
@@ -272,6 +295,9 @@ impl PreparedFragmentBudget {
     }
 
     pub const fn generous_default() -> Self {
+        // “generous” 的意思不是无限大，
+        // 而是在一般大图下允许预碎片化明显发挥作用，
+        // 但在极端超大 polygon / 超多跨 tile 图元时仍然有保护阀。
         Self::new(
             DEFAULT_PREPARED_FRAGMENT_BUDGET,
             DEFAULT_PREPARED_POINT_BUDGET,
@@ -321,15 +347,20 @@ impl PreparedTileFragments {
 /// 一次可见 shape 查询的统计信息。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShapeQueryStats {
+    /// 查询过程中命中的空间桶数量。
     pub bucket_hits: usize,
+    /// 进入精确相交判断前的候选 shape 数。
     pub candidate_shapes: usize,
+    /// 最终被认定为可见的 shape 数。
     pub visible_shapes: usize,
 }
 
 /// 可见 shape 查询结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VisibleShapeQuery {
+    /// 可见 shape 在 scene 中的索引列表。
     pub indices: Vec<usize>,
+    /// 这次查询的伴随统计信息。
     pub stats: ShapeQueryStats,
 }
 
@@ -444,6 +475,33 @@ impl ShapeSpatialIndex {
 }
 
 impl TileGridIndex {
+    /// 只根据一个世界 bounds 构造 tile grid。
+    ///
+    /// 这条路径给 hierarchy-driven renderer 用：
+    /// - 不要求先有完整 flat scene
+    /// - 但仍然复用现有 tile id / scissor / cache 体系
+    pub fn build_for_bounds(bounds: Bounds, divisions: u32) -> Self {
+        let cols = clamp_tile_grid_divisions(divisions);
+        let rows = cols;
+        let tile_width = (bounds.width().max(1.0) / cols as f32).max(1.0);
+        let tile_height = (bounds.height().max(1.0) / rows as f32).max(1.0);
+        let mut tile_layers = HashMap::new();
+        for col in 0..cols {
+            for row in 0..rows {
+                tile_layers.insert(TileId { col, row }, Vec::new());
+            }
+        }
+        Self {
+            scene_bounds: bounds,
+            tile_width,
+            tile_height,
+            cols,
+            rows,
+            tile_layers,
+            buckets_by_layer: HashMap::new(),
+        }
+    }
+
     /// 用默认密度构建 tile grid。
     pub fn build(scene: &Scene) -> Self {
         Self::build_with_divisions(scene, DEFAULT_TILE_GRID_DIVISIONS)
@@ -453,6 +511,12 @@ impl TileGridIndex {
     ///
     /// 这里的 `divisions = N` 表示把场景 bounds 分成 `N x N` 块。
     pub fn build_with_divisions(scene: &Scene, divisions: u32) -> Self {
+        // 这里故意在构建期就把 `tile -> layer -> shape_indices` 组织好，
+        // 而不是等渲染时“进了 tile 再按 layer 分组”。
+        // 这么做的收益是：
+        // - layer 显隐切换时粒度更细
+        // - renderer 可以天然把 cache key 放到 `tile + layer`
+        // - direct hierarchy 路径也能复用相同的调度外壳
         let scene_bounds = scene.bounds().unwrap_or(Bounds::new(0.0, 0.0, 1.0, 1.0));
         let cols = clamp_tile_grid_divisions(divisions);
         let rows = cols;
@@ -500,6 +564,10 @@ impl TileGridIndex {
     /// 当前 grid 的密度。
     pub fn divisions(&self) -> u32 {
         self.cols.max(self.rows) as u32
+    }
+
+    pub fn scene_bounds(&self) -> Bounds {
+        self.scene_bounds
     }
 
     /// 取出一个 tile 下出现过哪些 layer。
@@ -667,6 +735,9 @@ pub fn query_visible_shape_indices(
 
 /// 查询与可见 world bounds 相交的 tile 列表。
 pub fn query_visible_tiles(index: &TileGridIndex, visible_world_bounds: Bounds) -> Vec<TileId> {
+    // 这里查的只是“理论上和视口相交的 tile id”，
+    // 不是“这些 tile 里一定已经有 GPU 缓存”。
+    // 后者会在 renderer 的 tile cache / pending build 层再区分。
     let min_col = cell_for(
         visible_world_bounds.min_x,
         index.scene_bounds.min_x,
@@ -1250,7 +1321,7 @@ pub fn build_scaled_scene_vertices_for_prepared_fragments_with_hatch_styles(
     vertices
 }
 
-fn emit_scaled_shape_vertices(
+pub fn emit_scaled_shape_vertices(
     vertices: &mut Vec<LineVertex>,
     layer: LayerId,
     source_points: &[Vec2],
@@ -1261,10 +1332,25 @@ fn emit_scaled_shape_vertices(
     scaled_tile_bounds: Option<Bounds>,
     hatch_style: HatchStylePreset,
 ) {
+    // 这条函数是 geometry 模块最核心的“形状 -> 顶点”入口。
+    //
+    // 它内部同时承担了几层职责：
+    // 1. 世界坐标 -> 当前 zoom 下的屏幕逻辑坐标
+    // 2. 根据 tile bounds 做局部裁剪
+    // 3. 根据屏幕尺寸选择 tiny marker / coarse LOD / suppress fill
+    // 4. 按最终模式发 outline / fill 顶点
+    //
+    // 看起来职责多，但这样可以把“一个 shape 的所有最终发射决策”放在同一处，
+    // 后面调优时也更容易对着 sample 逐层剥。
     let outline_color = layer_color(layer);
     let width = stroke_width_for_layer(layer, stroke_width_world, zoom);
 
     if closed {
+        // 闭合图形需要同时维护两组点：
+        // - outline_points：尽量保留真实外轮廓语义
+        // - fill_points：必要时允许裁到 tile 内部
+        //
+        // 这样可以避免“为了 tile 裁剪 fill，顺手把 outline 也裁出内部假边”。
         let outline_points: Vec<Vec2> = source_points
             .iter()
             .copied()
@@ -1436,6 +1522,10 @@ fn screen_bounds_from_points(points: &[Vec2]) -> Option<Bounds> {
 }
 
 fn should_use_coarse_closed_shape_lod(points: &[Vec2]) -> bool {
+    // 这里有意要求：
+    // - 点数本来就很多
+    // - 屏幕尺寸已经很小
+    // 两个条件同时成立，才值得做降采样。
     if points.len() < CLOSED_SHAPE_LOD_MIN_POINTS {
         return false;
     }
@@ -1466,6 +1556,9 @@ fn tiny_open_shape_marker_segment(points: &[Vec2]) -> Option<[Vec2; 2]> {
 }
 
 fn should_suppress_fill_for_small_closed_shape(points: &[Vec2]) -> bool {
+    // 这是一个很实用的中间档：
+    // 图形还没小到必须 marker，但 hatch 细节已经没有信息密度时，
+    // 先退到 outline，可以省掉不少 fill 顶点。
     let Some(bounds) = screen_bounds_from_points(points) else {
         return false;
     };
@@ -1489,6 +1582,8 @@ fn coarse_closed_shape_target_points(points: &[Vec2]) -> Option<usize> {
 }
 
 fn coarse_closed_shape_points(points: &[Vec2]) -> Option<Vec<Vec2>> {
+    // 这里不是做严格几何保真，而是做“远景视觉上够像”的降采样。
+    // 所以实现上选择了稳定、便宜的等步长采样，而不是更复杂的简化算法。
     let normalized = normalized_closed_points(points);
     if normalized.len() < 3 {
         return None;
@@ -1534,6 +1629,8 @@ fn coarse_open_polyline_target_points(points: &[Vec2]) -> Option<usize> {
 }
 
 fn coarse_open_polyline_points(points: &[Vec2]) -> Option<Vec<Vec2>> {
+    // 开放折线的策略和闭合图形类似：
+    // 远景下保住整体走向，比保住每个拐点更重要。
     if points.len() < POLYLINE_LOD_MIN_POINTS {
         return None;
     }
@@ -1580,6 +1677,9 @@ fn scale_bounds(bounds: Bounds, zoom: f32) -> Bounds {
 }
 
 fn clip_closed_polygon_to_bounds(points: &[Vec2], bounds: Bounds) -> Vec<Vec2> {
+    // 这里用的是 Sutherland-Hodgman 风格的逐边裁剪。
+    // 之所以自己保留一个轻量实现，而不是引入更重的几何库，
+    // 是因为这里的需求很稳定：只需要 axis-aligned rect clipping。
     let mut output = normalized_closed_points(points);
     if output.len() < 3 {
         return Vec::new();
@@ -1666,6 +1766,9 @@ fn emit_scaled_prepared_closed_fragment_vertices(
     effective_mode: ClosedShapeDrawMode,
     hatch_style: HatchStylePreset,
 ) {
+    // 这条路径和普通 closed shape 的区别在于：
+    // fragment 已经在“世界坐标层”保证只属于某个 tile，
+    // 所以这里不再做 tile clipping，而是直接处理 LOD / fill / outline 发射。
     let outline_color = layer_color(fragment.layer);
     let width = stroke_width_for_layer(fragment.layer, fragment.stroke_width_world, zoom);
     let fill_points: Vec<Vec2> = fragment
@@ -1787,6 +1890,8 @@ fn emit_tiny_closed_shape_marker(
     effective_mode: ClosedShapeDrawMode,
     hatch_style: HatchStylePreset,
 ) {
+    // tiny marker 的目的不是“还原真实几何”，
+    // 而是保证用户在极远景下至少知道这里存在图形。
     let half_extent = TINY_SHAPE_MARKER_SCREEN_SIZE * 0.5;
     let corners = [
         center + Vec2::new(-half_extent, -half_extent),
@@ -1830,6 +1935,9 @@ fn emit_clipped_closed_outline_segments(
     width: f32,
     color: [f32; 4],
 ) {
+    // outline 这里按“真实边段逐条裁剪”处理，
+    // 而不是直接拿 fill polygon 的裁剪结果重建轮廓，
+    // 否则 tile 内部会凭空多出一圈假边。
     if points.len() < 2 {
         return;
     }

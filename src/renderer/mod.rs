@@ -16,8 +16,9 @@ pub mod pipeline;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    hash::Hash,
-    sync::Arc,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::{Arc, Mutex, mpsc},
+    thread,
 };
 
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
@@ -28,6 +29,10 @@ use winit::{dpi::PhysicalSize, window::Window};
 use crate::{
     camera::Camera2D,
     error::AppError,
+    layout::{
+        LayoutBundle, LayoutViewBuildOptions, visit_layout_shape_bounds_in_view,
+        visit_layout_shapes_in_view,
+    },
     scene::{LayerId, Scene},
 };
 
@@ -40,8 +45,8 @@ use self::{
         build_hatch_style_signature, build_render_cache_key_with_hatch_styles,
         build_scaled_scene_vertices_for_prepared_fragments_with_hatch_styles,
         build_scaled_scene_vertices_for_tile, camera_visible_world_bounds,
-        layer_hatch_style_hash_value, logical_viewport_size, prepare_large_shape_tile_fragments,
-        query_visible_shapes, query_visible_tiles,
+        emit_scaled_shape_vertices, layer_hatch_style_hash_value, logical_viewport_size,
+        prepare_large_shape_tile_fragments, query_visible_shapes, query_visible_tiles,
     },
     pipeline::{ScenePipeline, SceneUniform},
 };
@@ -49,36 +54,67 @@ use self::{
 /// 暴露给 UI 的渲染调试统计。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RenderDebugStats {
+    /// 当前数据源总共有多少 shape。
     pub total_shapes: usize,
+    /// 经过空间索引初筛后的候选 shape 数。
     pub candidate_shapes: usize,
+    /// 最终落进当前可见查询结果的 shape 数。
     pub visible_shapes: usize,
+    /// 可见查询过程中命中的空间桶数量。
     pub bucket_hits: usize,
+    /// 当前帧准备提交给 GPU 的顶点数。
     pub vertex_count: usize,
+    /// 当前帧真正发出的 draw 次数。
     pub draw_calls: usize,
+    /// 当前视图相交的 tile 数量。
     pub visible_tiles: usize,
+    /// tile 级 GPU cache 命中次数。
     pub tile_cache_hits: usize,
+    /// tile 级 GPU cache 未命中次数。
     pub tile_cache_misses: usize,
+    /// layer 级别的请求命中次数。
     pub layer_cache_hits: usize,
+    /// layer 级别的请求未命中次数。
     pub layer_cache_misses: usize,
+    /// 当前 cache 里还活着的 `tile + layer` 条目数。
     pub cache_entries: usize,
+    /// cache 允许保留的条目容量上限。
     pub cache_capacity: usize,
+    /// 当前 cache 粗略估计的总字节占用。
     pub cache_bytes: usize,
+    /// 当前场景生命周期里累计驱逐的 cache 条目数。
     pub cache_evictions: usize,
+    /// 被预碎片化路径接管的 shape 数。
     pub prepared_shapes: usize,
+    /// 预碎片化后触达过的 tile 数。
     pub prepared_tiles: usize,
+    /// 预碎片化后生成的局部 fragment 数。
     pub prepared_fragments: usize,
+    /// 当前仍在等待构建的 `tile + layer` 条目数。
     pub pending_entries: usize,
+    /// 本帧允许消化的渐进式构建预算。
     pub build_budget: usize,
+    /// 视图切换后被丢弃的过期 pending 条目数。
     pub dropped_stale_entries: usize,
+    /// 当前正在优先补建的活动 layer。
     pub active_layer: Option<LayerId>,
+    /// 活动 layer 尚未完成的条目数。
     pub active_layer_pending: usize,
+    /// 活动 layer 的估算工作量。
     pub active_layer_estimated_work: usize,
+    /// 活动 layer 当前采用的推进模式。
     pub active_layer_progress_mode: Option<ActiveLayerProgressMode>,
+    /// 当前帧是否绕过了渐进式模式。
     pub progressive_bypassed: bool,
+    /// 当前 per-layer bypass entry 阈值。
     pub layer_bypass_entry_threshold: usize,
+    /// 当前 per-layer bypass work 阈值。
     pub layer_bypass_work_threshold: usize,
+    /// 这一帧 scene/tile 调度是否命中了稳定 cache 路径。
     pub cache_hit: bool,
+    /// 当前使用的 hatch 间距。
     pub hatch_spacing: f32,
+    /// 当前使用的 hatch 线宽。
     pub hatch_width: f32,
 }
 
@@ -103,9 +139,13 @@ pub enum ActiveLayerProgressMode {
 /// - UI 里该怎么解释“为什么这层一帧补完/为什么这层还在渐进”
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LayerPendingStats {
+    /// 这一层还差多少个 `tile + layer` 条目没完成。
     pub pending_entries: usize,
+    /// 把 pending 条目、普通 shape、prepared fragment 压成的粗略工作量。
     pub estimated_work_units: usize,
+    /// 这一层里预碎片化 fragment 的数量。
     pub prepared_fragment_count: usize,
+    /// 这一层里普通 shape 的数量。
     pub regular_shape_count: usize,
 }
 
@@ -193,12 +233,19 @@ impl RenderDebugStats {
 /// 这样切换单个 layer 的显隐或显示模式时，其他 layer 更有机会继续复用旧 buffer。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TileCacheKey {
+    /// 当前几何数据所属的 scene 版本。
     scene_revision: u64,
+    /// 当前缓存归属的量化 zoom。
     zoom_bits: u32,
+    /// 命中的 tile 编号。
     tile_id: TileId,
+    /// 命中的 layer。
     layer: LayerId,
+    /// 当前实际闭合图元画法的紧凑标签。
     effective_mode_tag: u8,
+    /// 当前 hatch 参数签名。
     hatch_signature: u64,
+    /// 当前 hatch 预设签名。
     effective_hatch_style_tag: u8,
 }
 
@@ -208,9 +255,13 @@ struct TileCacheKey {
 /// 所以 domain 可以收敛成只描述那些"会影响所有 layer 顶点坐标或图案"的全局条件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TileCacheDomainKey {
+    /// 当前 scene 版本。
     scene_revision: u64,
+    /// 当前 domain 对应的量化 zoom。
     zoom_bits: u32,
+    /// 全局 hatch 参数签名。
     hatch_signature: u64,
+    /// 全局 hatch 风格签名。
     hatch_style_signature: u64,
 }
 
@@ -220,7 +271,9 @@ struct TileCacheDomainKey {
 /// 而是只承认最新视图状态；旧视图遗留的工作要么跳过，要么被丢弃。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingTileBuild {
+    /// 这条构建请求属于哪个视图修订号。
     view_revision: u64,
+    /// 需要补建的 `tile + layer` key。
     tile_key: TileCacheKey,
 }
 
@@ -231,9 +284,151 @@ struct PendingTileBuild {
 /// 以及第二层合批后的 GPU buffer；那样会显著放大内存占用，
 /// 但对实际卡顿改善并不明显。
 struct TileCacheEntry {
+    /// 同一个 `tile + layer` 可能因为设备单 buffer 上限被拆成多段。
     vertex_buffers: Vec<TileCacheBufferSegment>,
+    /// 估算缓存占用时使用的字节数。
     byte_size: usize,
+    /// 近似 LRU 的访问时钟。
     last_used_tick: u64,
+}
+
+/// 针对“已经完全稳定的 direct hierarchy 可见集”的第二层显示合批。
+///
+/// 它和 `tile_vertex_cache` 的关系是：
+/// - `tile_vertex_cache`：偏构建复用，粒度是 `tile + layer`
+/// - `VisibleDisplayBatch`：偏静态显示复用，粒度是“当前整屏可见集”
+///
+/// 之所以保留这第二层，是因为 sample 显示静态帧主要卡在 GPU/present，
+/// 而不是 tile worker；这时候把很多小 draw 压成少量大 draw 更值钱。
+struct VisibleDisplayBatch {
+    /// 当前可见集 key 列表的稳定哈希。
+    source_hash: u64,
+    /// 当前可见集 key 的条目数。
+    source_len: usize,
+    /// 合批后的 GPU buffer 段列表。
+    vertex_buffers: Vec<TileCacheBufferSegment>,
+    /// 这批合并显示 buffer 的粗略字节占用。
+    byte_size: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HierarchyTileSource {
+    /// 原始 hierarchy 数据源。
+    bundle: LayoutBundle,
+    /// 这一组 direct hierarchy 构建共享的基础选项。
+    ///
+    /// renderer 后续会在它上面继续叠：
+    /// - 当前 tile bounds
+    /// - 当前 layer filter
+    base_options: LayoutViewBuildOptions,
+    /// 当前层级范围内真实存在过的 layer 列表。
+    layer_ids: Vec<LayerId>,
+    /// 当前 range 的粗略总 shape 数，用于 UI/debug 展示。
+    total_shape_estimate: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HierarchyTileBuildTask {
+    /// 任务派发时所属的视图修订号。
+    view_revision: u64,
+    /// 这次要构建的 `tile + layer` key。
+    tile_key: TileCacheKey,
+    /// 共享的 hierarchy 数据源与基础配置。
+    source: Arc<HierarchyTileSource>,
+    /// 这次构建采用的 zoom 基准。
+    zoom: f32,
+    /// 当前 tile 实际生效的闭合图元画法。
+    effective_mode: ClosedShapeDrawMode,
+    /// 当前 tile 实际生效的 hatch 预设。
+    effective_hatch_style: HatchStylePreset,
+    /// 当前 tile 的世界坐标 bounds。
+    tile_bounds: crate::scene::Bounds,
+}
+
+#[derive(Debug)]
+struct HierarchyTileBuildResult {
+    /// 结果所属的视图修订号。
+    view_revision: u64,
+    /// 已完成构建的 `tile + layer` key。
+    tile_key: TileCacheKey,
+    /// worker 线程生成好的 CPU 顶点。
+    vertices: Vec<LineVertex>,
+}
+
+struct HierarchyTileBuildWorkers {
+    /// 主线程向 worker 派发构建任务的发送端。
+    task_sender: mpsc::Sender<HierarchyTileBuildTask>,
+    /// worker 把构建结果送回主线程的接收端。
+    result_receiver: mpsc::Receiver<HierarchyTileBuildResult>,
+    /// 后台工作线程句柄，保留它们是为了生命周期跟随 renderer。
+    _threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl HierarchyTileBuildWorkers {
+    /// 创建 direct hierarchy tile 构建用的后台 worker 池。
+    ///
+    /// 这里故意只把“CPU 顶点生成”挪到后台：
+    /// - hierarchy 遍历
+    /// - tile 局部裁剪
+    /// - 顶点发射
+    ///
+    /// GPU buffer 创建仍然留在主线程，避免和 wgpu 资源模型缠在一起。
+    fn new() -> Self {
+        let (task_sender, task_receiver) = mpsc::channel::<HierarchyTileBuildTask>();
+        let (result_sender, result_receiver) = mpsc::channel::<HierarchyTileBuildResult>();
+        let receiver = Arc::new(Mutex::new(task_receiver));
+        let worker_count = thread::available_parallelism()
+            .map(|count| count.get().clamp(1, 8))
+            .unwrap_or(4);
+        let mut threads = Vec::with_capacity(worker_count);
+
+        for index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            let result_sender = result_sender.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name(format!("hierarchy-tile-worker-{index}"))
+                    .spawn(move || {
+                        loop {
+                            let task = {
+                                let Ok(receiver) = receiver.lock() else {
+                                    break;
+                                };
+                                receiver.recv()
+                            };
+                            let Ok(task) = task else {
+                                break;
+                            };
+                            let vertices = build_hierarchy_tile_vertices(
+                                &task.source,
+                                task.tile_key,
+                                task.zoom,
+                                task.effective_mode,
+                                task.effective_hatch_style,
+                                task.tile_bounds,
+                            );
+                            if result_sender
+                                .send(HierarchyTileBuildResult {
+                                    view_revision: task.view_revision,
+                                    tile_key: task.tile_key,
+                                    vertices,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .expect("spawn hierarchy tile worker"),
+            );
+        }
+
+        Self {
+            task_sender,
+            result_receiver,
+            _threads: threads,
+        }
+    }
 }
 
 struct TileCacheBufferSegment {
@@ -274,6 +469,21 @@ pub const MAX_LAYER_BYPASS_WORK_THRESHOLD: usize = 1024;
 const LAYER_WORK_ENTRY_WEIGHT: usize = 1;
 const LAYER_WORK_PREPARED_WEIGHT: usize = 4;
 const LAYER_WORK_REGULAR_WEIGHT: usize = 2;
+/// direct hierarchy 超远景下，内部允许把 hatch/hatch-outline 临时退成 outline。
+///
+/// 注意这不是“修改用户配置”，而是 renderer 的内部 far-zoom 退化：
+/// 放大到用户能看清时，会自动回到原来的显示模式。
+const DIRECT_HIERARCHY_OUTLINE_ONLY_MAX_ZOOM: f32 = 0.02;
+/// direct hierarchy tile cache 的 zoom 桶比例。
+///
+/// 如果直接用精确 zoom 做 cache key，滚轮缩放时会几乎每一帧都失效；
+/// 这里改成邻近 zoom 共用一个桶，优先复用已有 tile 几何。
+const DIRECT_HIERARCHY_TILE_CACHE_ZOOM_BUCKET_RATIO: f32 = 1.08;
+/// direct hierarchy 内部允许使用的最粗 tile grid。
+///
+/// 现在把它收到了 `1x1`，原因是当前瓶颈已经更偏 GPU/present：
+/// 对超远景全局视图来说，继续切很多 tile 容易重复生成和重复 draw。
+const DIRECT_HIERARCHY_MAX_TILE_GRID_DIVISIONS: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CachedShapeQueryStats {
@@ -283,34 +493,204 @@ struct CachedShapeQueryStats {
     visible_tiles: usize,
 }
 
+fn effective_draw_mode_for_current_view(
+    base_mode: ClosedShapeDrawMode,
+    hierarchy_tile_source_active: bool,
+    zoom: f32,
+) -> ClosedShapeDrawMode {
+    if hierarchy_tile_source_active && zoom <= DIRECT_HIERARCHY_OUTLINE_ONLY_MAX_ZOOM {
+        ClosedShapeDrawMode::Outline
+    } else {
+        base_mode
+    }
+}
+
+fn quantize_zoom_for_tile_cache(zoom: f32, hierarchy_tile_source_active: bool) -> f32 {
+    // 旧实现里 zoom 只要有微小变化，就会让 tile cache 整锅失效。
+    // 对大版图来说，这会把 worker 吞吐浪费在“每次缩放都从头重建”上。
+    if !hierarchy_tile_source_active || zoom <= f32::EPSILON {
+        return zoom;
+    }
+
+    let ratio = DIRECT_HIERARCHY_TILE_CACHE_ZOOM_BUCKET_RATIO;
+    let bucket_index = (zoom.ln() / ratio.ln()).round();
+    ratio.powf(bucket_index)
+}
+
+fn effective_tile_grid_divisions(
+    requested_divisions: u32,
+    hierarchy_tile_source_active: bool,
+) -> u32 {
+    // direct hierarchy 路径下，这里不是把 UI 配置“改掉”，
+    // 而是内部按更保守的策略重解释它，优先减少远景全局视图的重复工作。
+    if hierarchy_tile_source_active {
+        requested_divisions.min(DIRECT_HIERARCHY_MAX_TILE_GRID_DIVISIONS)
+    } else {
+        requested_divisions
+    }
+}
+
+fn should_use_per_tile_scissor(hierarchy_tile_source_active: bool) -> bool {
+    !hierarchy_tile_source_active
+}
+
+fn should_skip_static_cache_refresh(
+    cached_scene_key: Option<RenderCacheKey>,
+    next_scene_key: RenderCacheKey,
+    tile_cache_domain_matches: bool,
+    pending_tile_builds: usize,
+    in_flight_tile_builds: usize,
+) -> bool {
+    // 这是一个非常保守的 fast path：
+    // 只有当 scene key、tile cache domain、pending/in-flight 全都稳定时，
+    // 才允许整帧跳过 update_scene_cache 的 bookkeeping。
+    tile_cache_domain_matches
+        && cached_scene_key == Some(next_scene_key)
+        && pending_tile_builds == 0
+        && in_flight_tile_builds == 0
+}
+
+fn should_use_static_visible_display_batch(
+    hierarchy_tile_source_active: bool,
+    freeze_interaction_view: bool,
+    visible_tile_key_count: usize,
+    pending_tile_builds: usize,
+    in_flight_tile_builds: usize,
+) -> bool {
+    // 只有 direct hierarchy 的完全静态帧才值得做第二层显示合批。
+    // 一旦还在交互、还有 pending、或者 tile 正在后台构建，
+    // 再去做这层 copy 反而会增加额外开销。
+    hierarchy_tile_source_active
+        && !freeze_interaction_view
+        && visible_tile_key_count > 0
+        && pending_tile_builds == 0
+        && in_flight_tile_builds == 0
+}
+
+fn batch_visible_vertex_segments(
+    segment_vertex_counts: &[usize],
+    max_vertices_per_buffer: usize,
+) -> Vec<usize> {
+    // 输入是一串已有 tile cache segment 的顶点数，
+    // 输出是“如果把这些 segment 尽量拼成少量大 buffer”，每段该放多少顶点。
+    if segment_vertex_counts.is_empty() || max_vertices_per_buffer == 0 {
+        return Vec::new();
+    }
+
+    let mut merged = Vec::new();
+    let mut current = 0usize;
+    for count in segment_vertex_counts
+        .iter()
+        .copied()
+        .filter(|count| *count > 0)
+    {
+        let mut remaining = count;
+        while remaining > 0 {
+            let available = max_vertices_per_buffer.saturating_sub(current);
+            if available == 0 {
+                if current > 0 {
+                    merged.push(current);
+                }
+                current = 0;
+                continue;
+            }
+            let take = remaining.min(available);
+            current += take;
+            remaining -= take;
+            if current == max_vertices_per_buffer {
+                merged.push(current);
+                current = 0;
+            }
+        }
+    }
+
+    if current > 0 {
+        merged.push(current);
+    }
+    merged
+}
+
+fn hash_visible_tile_keys(visible_tile_keys: &[TileCacheKey]) -> u64 {
+    // 这不是安全校验，只是一个快速“可见集有没有变”的签名。
+    let mut hasher = DefaultHasher::new();
+    visible_tile_keys.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// GPU 渲染器。
 pub struct Renderer {
+    /// 交换链输出 surface。
     surface: wgpu::Surface<'static>,
+    /// 主设备对象，负责创建 buffer / pipeline / bind group 等 GPU 资源。
     device: wgpu::Device,
+    /// 提交命令和上传数据到 GPU 的队列。
     queue: wgpu::Queue,
+    /// 当前 surface 配置。
     config: wgpu::SurfaceConfiguration,
+    /// 当前窗口物理尺寸。
     size: PhysicalSize<u32>,
+    /// egui 的 wgpu 渲染器。
     egui_renderer: EguiRenderer,
+    /// 主场景绘制 pipeline。
     scene_pipeline: ScenePipeline,
+    /// direct hierarchy tile 构建用的后台 worker 池。
+    hierarchy_tile_workers: HierarchyTileBuildWorkers,
+    /// 当前 renderer 消费的扁平场景。
+    ///
+    /// 在 direct hierarchy 模式下，这里通常是空 Scene，
+    /// 真正的几何来源会转移到 `hierarchy_tile_source`。
     scene: Arc<Scene>,
+    /// 大场景 direct hierarchy 渲染时的分层数据源摘要。
+    hierarchy_tile_source: Option<Arc<HierarchyTileSource>>,
+    /// `tile -> layers` 的惰性摘要。
+    ///
+    /// 只有 direct hierarchy 模式下才会按需填充。
+    hierarchy_tile_layer_hints: HashMap<TileId, Vec<LayerId>>,
+    /// 普通 Scene 路径使用的 shape 可见查询索引。
     spatial_index: ShapeSpatialIndex,
+    /// 当前渲染路径统一使用的 tile 网格。
     tile_grid: TileGridIndex,
+    /// 对超大 shape 的 tile 预碎片化缓存。
     prepared_tile_fragments: PreparedTileFragments,
+    /// UI 侧配置的 tile grid 密度。
     tile_grid_divisions: u32,
+    /// 全局默认闭合图形显示模式。
     draw_mode: ClosedShapeDrawMode,
+    /// 每层闭合图形显示模式覆盖。
     layer_draw_modes: BTreeMap<LayerId, ClosedShapeDrawMode>,
+    /// 全局 hatch 参数。
     hatch_params: HatchParams,
+    /// 全局默认 hatch 风格。
     hatch_style: HatchStylePreset,
+    /// 每层 hatch 风格覆盖。
     layer_hatch_styles: BTreeMap<LayerId, HatchStylePreset>,
+    /// tile cache 容量上限。
     tile_cache_capacity: usize,
+    /// 场景/数据源发生语义变化时递增的版本号。
     scene_revision: u64,
+    /// 近似 LRU 使用的访问时钟。
     cache_access_tick: u64,
+    /// 从启动到现在累计驱逐掉的 cache 条目数。
     total_cache_evictions: usize,
+    /// 当前帧级 scene cache key。
     cached_scene_key: Option<RenderCacheKey>,
+    /// 当前 tile 顶点缓存所在的“域”。
     tile_cache_domain: Option<TileCacheDomainKey>,
+    /// 第一层 GPU cache：`tile + layer -> vertex buffers`。
     tile_vertex_cache: HashMap<TileCacheKey, TileCacheEntry>,
+    /// 第二层显示 cache：只服务于稳定静态视图的批处理结果。
+    visible_display_batch: Option<VisibleDisplayBatch>,
+    /// 已知为空的 `tile + layer` key。
+    ///
+    /// 这样后续看到同一个 key 时可以直接跳过，不必重复构建。
+    empty_tile_keys: HashSet<TileCacheKey>,
+    /// 当前仍在 worker 线程里构建中的 tile keys。
+    in_flight_hierarchy_tile_builds: HashSet<TileCacheKey>,
+    /// 当前这一帧最终允许显示的 tile keys。
     visible_tile_keys: Vec<TileCacheKey>,
+    /// 当前视图理论上需要的全部 tile keys。
     requested_tile_keys: Vec<TileCacheKey>,
+    /// 尚未命中 cache、等待构建的 tile keys。
     pending_tile_builds: VecDeque<PendingTileBuild>,
     /// 当前处在“构建渐进流程”中的活动 layer。
     ///
@@ -336,13 +716,19 @@ pub struct Renderer {
     /// 每次影响可见结果的条件变化后，这个数字都会递增；
     /// 旧 revision 留下的 pending 构建请求应该被直接丢弃。
     view_revision: u64,
+    /// 每帧最多允许消化多少个 pending 构建任务。
     progressive_build_budget: usize,
+    /// 当待补条目很少时，允许直接 bypass 渐进补全。
     progressive_bypass_threshold: usize,
+    /// 当前活动 layer 触发 bypass 的 entry 阈值。
     layer_bypass_entry_threshold: usize,
+    /// 当前活动 layer 触发 bypass 的估算工作量阈值。
     layer_bypass_work_threshold: usize,
     /// 累计丢掉了多少条“已经过期的旧视图构建请求”。
     total_stale_drops: usize,
+    /// 最近一次 visible query 的统计摘要。
     shape_query_stats: CachedShapeQueryStats,
+    /// 暴露给 UI 的调试统计。
     debug_stats: RenderDebugStats,
 }
 
@@ -402,6 +788,7 @@ impl Renderer {
 
         let egui_renderer = EguiRenderer::new(&device, format, RendererOptions::default());
         let scene_pipeline = ScenePipeline::new(&device, format);
+        let hierarchy_tile_workers = HierarchyTileBuildWorkers::new();
         let empty_scene = Arc::new(Scene::empty());
 
         Ok(Self {
@@ -412,7 +799,10 @@ impl Renderer {
             size,
             egui_renderer,
             scene_pipeline,
+            hierarchy_tile_workers,
             scene: Arc::clone(&empty_scene),
+            hierarchy_tile_source: None,
+            hierarchy_tile_layer_hints: HashMap::new(),
             spatial_index: ShapeSpatialIndex::build(&empty_scene),
             tile_grid: TileGridIndex::build_with_divisions(
                 &empty_scene,
@@ -435,6 +825,9 @@ impl Renderer {
             cached_scene_key: None,
             tile_cache_domain: None,
             tile_vertex_cache: HashMap::new(),
+            visible_display_batch: None,
+            empty_tile_keys: HashSet::new(),
+            in_flight_hierarchy_tile_builds: HashSet::new(),
             visible_tile_keys: Vec::new(),
             requested_tile_keys: Vec::new(),
             pending_tile_builds: VecDeque::new(),
@@ -453,6 +846,7 @@ impl Renderer {
         })
     }
 
+    /// 当前 surface 的物理尺寸。
     pub fn size(&self) -> PhysicalSize<u32> {
         self.size
     }
@@ -463,6 +857,9 @@ impl Renderer {
     }
 
     /// 当前 tile grid 密度。
+    ///
+    /// 注意在 direct hierarchy 模式下，内部实际使用的密度可能更粗，
+    /// 这里返回的是 UI 配置值本身。
     pub fn tile_grid_divisions(&self) -> u32 {
         self.tile_grid_divisions
     }
@@ -524,8 +921,20 @@ impl Renderer {
         }
 
         self.tile_grid_divisions = divisions;
-        self.tile_grid = TileGridIndex::build_with_divisions(&self.scene, self.tile_grid_divisions);
-        self.rebuild_prepared_tile_fragments();
+        self.tile_grid = if self.hierarchy_tile_source.is_some() {
+            TileGridIndex::build_for_bounds(
+                self.tile_grid.scene_bounds(),
+                effective_tile_grid_divisions(self.tile_grid_divisions, true),
+            )
+        } else {
+            TileGridIndex::build_with_divisions(&self.scene, self.tile_grid_divisions)
+        };
+        if self.hierarchy_tile_source.is_some() {
+            self.hierarchy_tile_layer_hints.clear();
+        }
+        if self.hierarchy_tile_source.is_none() {
+            self.rebuild_prepared_tile_fragments();
+        }
         self.invalidate_progressive_state(true);
         self.debug_stats.cache_hit = false;
     }
@@ -625,7 +1034,10 @@ impl Renderer {
         self.cached_scene_key = None;
         self.requested_tile_keys.clear();
         self.visible_tile_keys.clear();
+        self.visible_display_batch = None;
         self.pending_tile_builds.clear();
+        self.empty_tile_keys.clear();
+        self.in_flight_hierarchy_tile_builds.clear();
         self.debug_stats.cache_hit = false;
     }
 
@@ -643,8 +1055,11 @@ impl Renderer {
         self.cached_scene_key = None;
         self.requested_tile_keys.clear();
         self.visible_tile_keys.clear();
+        self.visible_display_batch = None;
         self.pending_tile_builds.clear();
         self.active_progressive_layer = None;
+        self.empty_tile_keys.clear();
+        self.in_flight_hierarchy_tile_builds.clear();
         self.debug_stats.cache_hit = false;
     }
 
@@ -669,8 +1084,11 @@ impl Renderer {
         self.cached_scene_key = None;
         self.requested_tile_keys.clear();
         self.visible_tile_keys.clear();
+        self.visible_display_batch = None;
         self.pending_tile_builds.clear();
         self.active_progressive_layer = None;
+        self.empty_tile_keys.clear();
+        self.in_flight_hierarchy_tile_builds.clear();
         self.debug_stats.cache_hit = false;
     }
 
@@ -685,10 +1103,13 @@ impl Renderer {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.cached_scene_key = None;
+        self.visible_display_batch = None;
     }
 
     /// 用新场景替换旧场景，并重建相关索引。
     pub fn update_scene(&mut self, scene: Arc<Scene>) {
+        self.hierarchy_tile_source = None;
+        self.hierarchy_tile_layer_hints.clear();
         self.scene = scene;
         self.spatial_index = ShapeSpatialIndex::build(&self.scene);
         self.tile_grid = TileGridIndex::build_with_divisions(&self.scene, self.tile_grid_divisions);
@@ -733,6 +1154,48 @@ impl Renderer {
             self.hatch_params.spacing,
             self.hatch_params.width,
         );
+    }
+
+    /// 切换到 direct hierarchy tile 渲染模式。
+    ///
+    /// 这里不会立刻把整份 hierarchy 扁平化成 Scene，
+    /// 而是只建立 renderer 后续按 tile 请求几何所需的最小摘要。
+    pub fn update_hierarchy_tile_source(
+        &mut self,
+        bundle: LayoutBundle,
+        base_options: LayoutViewBuildOptions,
+        layer_ids: Vec<LayerId>,
+        root_bounds: crate::scene::Bounds,
+        total_shape_estimate: usize,
+    ) {
+        let tile_grid = TileGridIndex::build_for_bounds(
+            root_bounds,
+            effective_tile_grid_divisions(self.tile_grid_divisions, true),
+        );
+        let base_options = base_options
+            .with_visible_world_bounds(Some(root_bounds))
+            .with_layer_filter(None);
+        let base_options = LayoutViewBuildOptions {
+            subtree_screen_lod: None,
+            ..base_options
+        };
+        self.hierarchy_tile_layer_hints.clear();
+        self.hierarchy_tile_source = Some(Arc::new(HierarchyTileSource {
+            bundle,
+            base_options,
+            layer_ids,
+            total_shape_estimate,
+        }));
+        self.scene = Arc::new(Scene::empty());
+        self.spatial_index = ShapeSpatialIndex::build(&self.scene);
+        self.tile_grid = tile_grid;
+        self.prepared_tile_fragments = PreparedTileFragments::default();
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.layer_draw_modes.clear();
+        self.layer_hatch_styles.clear();
+        self.shape_query_stats = CachedShapeQueryStats::default();
+        self.invalidate_progressive_state(true);
+        self.debug_stats = RenderDebugStats::default();
     }
 
     /// 当 scene 或 tile grid 变化时，预先把超大 shape 切成按 tile 组织的世界坐标碎片。
@@ -805,6 +1268,9 @@ impl Renderer {
             Vec2::new(self.config.width as f32, self.config.height as f32),
             pixels_per_point,
         );
+        let hierarchy_tile_source_active = self.hierarchy_tile_source.is_some();
+        let tile_cache_zoom_basis =
+            quantize_zoom_for_tile_cache(camera.zoom(), hierarchy_tile_source_active);
         // 交互冻结的目标不是“停止渲染”，而是：
         // - 拖拽/缩放过程中不要为每个中间状态都重建 scene cache
         // - 先复用上一帧已经稳定的视图
@@ -827,6 +1293,14 @@ impl Renderer {
             );
             self.display_zoom_basis = camera.zoom();
         }
+        let use_static_display_batch = should_use_static_visible_display_batch(
+            hierarchy_tile_source_active,
+            freeze_interaction_view,
+            self.visible_tile_keys.len(),
+            self.pending_tile_builds.len(),
+            self.in_flight_hierarchy_tile_builds.len(),
+        );
+        self.ensure_visible_display_batch(&mut encoder, use_static_display_batch);
 
         // 这里把“画布位置 + 相机平移”放进 uniform，
         // 这样 tile 顶点缓存就不用因为平移而重建。
@@ -844,7 +1318,7 @@ impl Renderer {
             position_scale: if freeze_interaction_view {
                 camera.zoom() / self.display_zoom_basis.max(f32::EPSILON)
             } else {
-                1.0
+                camera.zoom() / tile_cache_zoom_basis.max(f32::EPSILON)
             },
             _padding: [0.0; 4],
         };
@@ -893,26 +1367,53 @@ impl Renderer {
             .expect("canvas scissor");
             render_pass.set_pipeline(self.scene_pipeline.render_pipeline());
             render_pass.set_bind_group(0, &scene_bind_group, &[]);
-            let translation = camera.pan() + canvas_origin;
-            for tile_key in &self.visible_tile_keys {
-                if let Some(entry) = self.tile_vertex_cache.get(tile_key) {
-                    let tile_bounds = self.tile_grid.tile_bounds(tile_key.tile_id);
-                    if let Some(tile_scissor) = tile_scissor_rect(
-                        tile_bounds,
-                        camera.zoom(),
-                        translation,
-                        pixels_per_point,
-                        self.config.width,
-                        self.config.height,
-                    )
-                    .and_then(|tile_scissor| tile_scissor.intersect(canvas_scissor))
-                    {
-                        render_pass.set_scissor_rect(
-                            tile_scissor.x,
-                            tile_scissor.y,
-                            tile_scissor.width,
-                            tile_scissor.height,
-                        );
+            render_pass.set_scissor_rect(
+                canvas_scissor.x,
+                canvas_scissor.y,
+                canvas_scissor.width,
+                canvas_scissor.height,
+            );
+            if let Some(batch) = &self.visible_display_batch {
+                self.debug_stats.draw_calls = batch.vertex_buffers.len();
+                self.debug_stats.cache_bytes = self
+                    .tile_vertex_cache
+                    .values()
+                    .map(|entry| entry.byte_size)
+                    .sum::<usize>()
+                    + batch.byte_size;
+                for segment in &batch.vertex_buffers {
+                    render_pass.set_vertex_buffer(0, segment.vertex_buffer.slice(..));
+                    render_pass.draw(0..segment.vertex_count, 0..1);
+                }
+            } else {
+                self.debug_stats.draw_calls = self.visible_draw_segment_count_for_current_view();
+                let translation = camera.pan() + canvas_origin;
+                let use_per_tile_scissor =
+                    should_use_per_tile_scissor(self.hierarchy_tile_source.is_some());
+                for tile_key in &self.visible_tile_keys {
+                    if let Some(entry) = self.tile_vertex_cache.get(tile_key) {
+                        if use_per_tile_scissor {
+                            let tile_bounds = self.tile_grid.tile_bounds(tile_key.tile_id);
+                            if let Some(tile_scissor) = tile_scissor_rect(
+                                tile_bounds,
+                                camera.zoom(),
+                                translation,
+                                pixels_per_point,
+                                self.config.width,
+                                self.config.height,
+                            )
+                            .and_then(|tile_scissor| tile_scissor.intersect(canvas_scissor))
+                            {
+                                render_pass.set_scissor_rect(
+                                    tile_scissor.x,
+                                    tile_scissor.y,
+                                    tile_scissor.width,
+                                    tile_scissor.height,
+                                );
+                            } else {
+                                continue;
+                            }
+                        }
                         for segment in &entry.vertex_buffers {
                             render_pass.set_vertex_buffer(0, segment.vertex_buffer.slice(..));
                             render_pass.draw(0..segment.vertex_count, 0..1);
@@ -956,6 +1457,12 @@ impl Renderer {
     }
 
     /// 更新当前视口对应的 scene cache / tile cache / 调试统计。
+    ///
+    /// 这是 renderer 里最重要的“调度层”：
+    /// - 先决定当前视图有没有变
+    /// - 再决定 requested/visible tile keys
+    /// - 再决定 pending build、显示渐进、cache prune
+    /// - 最后产出这一帧的 debug 统计
     fn update_scene_cache(
         &mut self,
         camera: &Camera2D,
@@ -969,11 +1476,25 @@ impl Renderer {
         interaction_degraded: bool,
     ) {
         let _ = interaction_degraded;
+        self.collect_completed_hierarchy_tile_builds();
         let effective_layer_draw_modes = self.layer_draw_modes.clone();
-        let effective_draw_mode = draw_mode;
+        let hierarchy_tile_source_active = self.hierarchy_tile_source.is_some();
+        let tile_cache_zoom_basis =
+            quantize_zoom_for_tile_cache(camera.zoom(), hierarchy_tile_source_active);
+        let effective_draw_mode = effective_draw_mode_for_current_view(
+            draw_mode,
+            hierarchy_tile_source_active,
+            camera.zoom(),
+        );
         let previous_visible_tile_keys = self.visible_tile_keys.clone();
         let previous_requested_tile_keys = self.requested_tile_keys.clone();
 
+        // `cached_scene_key` 回答“这一帧要不要重新组织可见结果”；
+        // `tile_cache_domain` 回答“已经建好的 tile buffer 还能不能继续用”。
+        //
+        // 两者看起来接近，但作用不同：
+        // - 前者更偏视图 / 隐藏层 / 模式切换
+        // - 后者更偏顶点几何本身是否失效
         let key = build_render_cache_key_with_hatch_styles(
             self.scene_revision,
             camera,
@@ -990,14 +1511,27 @@ impl Renderer {
 
         let domain = TileCacheDomainKey {
             scene_revision: self.scene_revision,
-            zoom_bits: camera.zoom().to_bits(),
+            zoom_bits: tile_cache_zoom_basis.to_bits(),
             hatch_signature: build_hatch_signature(hatch_params),
             hatch_style_signature: build_hatch_style_signature(hatch_style)
                 ^ layer_hatch_style_hash_value(&self.layer_hatch_styles),
         };
         if self.tile_cache_domain != Some(domain) {
             self.tile_vertex_cache.clear();
+            self.empty_tile_keys.clear();
+            self.in_flight_hierarchy_tile_builds.clear();
             self.tile_cache_domain = Some(domain);
+        }
+        let tile_cache_domain_matches = self.tile_cache_domain == Some(domain);
+        if should_skip_static_cache_refresh(
+            self.cached_scene_key,
+            key,
+            tile_cache_domain_matches,
+            self.pending_tile_builds.len(),
+            self.in_flight_hierarchy_tile_builds.len(),
+        ) {
+            self.debug_stats.cache_hit = true;
+            return;
         }
 
         let mut dropped_this_frame = 0usize;
@@ -1008,47 +1542,79 @@ impl Renderer {
                 .map(|previous| previous.differs_only_by_pan(key))
                 .unwrap_or(false);
 
+            // 当前视图变化时，先重新推导 requested tile keys。
+            // direct hierarchy 与普通 Scene 路径在这里共用同一套调度壳，
+            // 只是 tile/layer 来源不同。
             let visible_world = camera_visible_world_bounds(camera, viewport_size);
             let visible_world_center = Vec2::new(
                 (visible_world.min_x + visible_world.max_x) * 0.5,
                 (visible_world.min_y + visible_world.max_y) * 0.5,
             );
-            let shape_query = query_visible_shapes(&self.scene, &self.spatial_index, visible_world);
             let visible_tiles = query_visible_tiles(&self.tile_grid, visible_world);
-            self.shape_query_stats = CachedShapeQueryStats {
-                candidate_shapes: shape_query.stats.candidate_shapes,
-                visible_shapes: shape_query.stats.visible_shapes,
-                bucket_hits: shape_query.stats.bucket_hits,
-                visible_tiles: visible_tiles.len(),
-            };
+            if self.hierarchy_tile_source.is_some() {
+                self.ensure_hierarchy_tile_layer_hints(&visible_tiles);
+            }
+            let layer_order = self
+                .hierarchy_tile_source
+                .as_ref()
+                .map(|source| source.layer_ids.clone())
+                .unwrap_or_else(|| self.scene.layer_ids());
+            if self.hierarchy_tile_source.is_some() {
+                self.shape_query_stats = CachedShapeQueryStats {
+                    candidate_shapes: 0,
+                    visible_shapes: 0,
+                    bucket_hits: 0,
+                    visible_tiles: visible_tiles.len(),
+                };
+            } else {
+                let shape_query =
+                    query_visible_shapes(&self.scene, &self.spatial_index, visible_world);
+                self.shape_query_stats = CachedShapeQueryStats {
+                    candidate_shapes: shape_query.stats.candidate_shapes,
+                    visible_shapes: shape_query.stats.visible_shapes,
+                    bucket_hits: shape_query.stats.bucket_hits,
+                    visible_tiles: visible_tiles.len(),
+                };
+            }
 
             let mut keys_by_layer: BTreeMap<LayerId, Vec<TileCacheKey>> = BTreeMap::new();
             for tile_id in visible_tiles.iter().copied() {
-                let mut tile_layers: BTreeSet<LayerId> = self
-                    .tile_grid
-                    .layers_for_tile(tile_id)
-                    .iter()
-                    .copied()
-                    .filter(|layer| !hidden_layers.contains(layer))
-                    .filter(|layer| {
-                        self.tile_grid
-                            .shape_indices_for_tile_layer(tile_id, *layer)
-                            .iter()
-                            .any(|shape_index| {
-                                !self
-                                    .prepared_tile_fragments
-                                    .shape_indices
-                                    .contains(shape_index)
-                            })
-                    })
-                    .collect();
-                tile_layers.extend(
-                    self.prepared_tile_fragments
+                let tile_layers: BTreeSet<LayerId> = if self.hierarchy_tile_source.is_some() {
+                    self.hierarchy_tile_layer_hints
+                        .get(&tile_id)
+                        .into_iter()
+                        .flat_map(|layers| layers.iter())
+                        .copied()
+                        .filter(|layer| !hidden_layers.contains(layer))
+                        .collect()
+                } else {
+                    let mut tile_layers: BTreeSet<LayerId> = self
+                        .tile_grid
                         .layers_for_tile(tile_id)
                         .iter()
                         .copied()
-                        .filter(|layer| !hidden_layers.contains(layer)),
-                );
+                        .filter(|layer| !hidden_layers.contains(layer))
+                        .filter(|layer| {
+                            self.tile_grid
+                                .shape_indices_for_tile_layer(tile_id, *layer)
+                                .iter()
+                                .any(|shape_index| {
+                                    !self
+                                        .prepared_tile_fragments
+                                        .shape_indices
+                                        .contains(shape_index)
+                                })
+                        })
+                        .collect();
+                    tile_layers.extend(
+                        self.prepared_tile_fragments
+                            .layers_for_tile(tile_id)
+                            .iter()
+                            .copied()
+                            .filter(|layer| !hidden_layers.contains(layer)),
+                    );
+                    tile_layers
+                };
 
                 for layer in tile_layers {
                     let effective_mode = effective_layer_draw_modes
@@ -1062,7 +1628,7 @@ impl Renderer {
                         .unwrap_or(hatch_style);
                     keys_by_layer.entry(layer).or_default().push(TileCacheKey {
                         scene_revision: self.scene_revision,
-                        zoom_bits: camera.zoom().to_bits(),
+                        zoom_bits: tile_cache_zoom_basis.to_bits(),
                         tile_id,
                         layer,
                         effective_mode_tag: effective_mode.as_tag(),
@@ -1073,7 +1639,7 @@ impl Renderer {
             }
             let next_requested_tile_keys = flatten_layer_major_requested_tile_keys(
                 keys_by_layer,
-                &self.scene.layer_ids(),
+                &layer_order,
                 &self.tile_grid,
                 visible_world_center,
             );
@@ -1154,7 +1720,7 @@ impl Renderer {
             )
         };
         self.process_pending_tile_builds(
-            camera.zoom(),
+            tile_cache_zoom_basis,
             effective_draw_mode,
             &effective_layer_draw_modes,
             hatch_style,
@@ -1239,6 +1805,9 @@ impl Renderer {
                         .sum::<usize>();
                     visible_tile_keys.push(tile_key);
                 }
+            } else if self.empty_tile_keys.contains(&tile_key) {
+                state.0 = true;
+                layer_cache_hits += 1;
             } else {
                 state.1 = true;
                 layer_cache_misses += 1;
@@ -1277,7 +1846,10 @@ impl Renderer {
             self.pending_tile_builds.len(),
         );
         self.debug_stats = RenderDebugStats::new(
-            self.scene.shapes().len(),
+            self.hierarchy_tile_source
+                .as_ref()
+                .map(|source| source.total_shape_estimate)
+                .unwrap_or_else(|| self.scene.shapes().len()),
             self.shape_query_stats.candidate_shapes,
             self.shape_query_stats.visible_shapes,
             self.shape_query_stats.bucket_hits,
@@ -1327,16 +1899,77 @@ impl Renderer {
         self.pending_tile_builds.clear();
         self.active_progressive_layer = None;
         self.shape_query_stats = CachedShapeQueryStats::default();
+        self.visible_display_batch = None;
         self.view_revision = self.view_revision.wrapping_add(1);
         if clear_gpu_cache {
             self.tile_cache_domain = None;
             self.tile_vertex_cache.clear();
+            self.empty_tile_keys.clear();
+            self.in_flight_hierarchy_tile_builds.clear();
+        }
+    }
+
+    /// 回收后台 worker 已完成的 direct hierarchy tile 构建结果。
+    fn collect_completed_hierarchy_tile_builds(&mut self) {
+        self.cache_access_tick = self.cache_access_tick.wrapping_add(1);
+        let current_tick = self.cache_access_tick;
+        let mut changed = false;
+
+        while let Ok(result) = self.hierarchy_tile_workers.result_receiver.try_recv() {
+            self.in_flight_hierarchy_tile_builds
+                .remove(&result.tile_key);
+            if result.view_revision != self.view_revision {
+                self.total_stale_drops += 1;
+                continue;
+            }
+            if let Some(entry) =
+                create_tile_cache_entry(&self.device, &result.vertices, current_tick)
+            {
+                self.tile_vertex_cache.insert(result.tile_key, entry);
+            } else {
+                self.empty_tile_keys.insert(result.tile_key);
+            }
+            changed = true;
+        }
+        if changed {
+            self.visible_display_batch = None;
+        }
+    }
+
+    /// 按需为当前可见 tiles 补 `tile -> layers` 摘要。
+    ///
+    /// 这里故意是 lazy 的：
+    /// 打开大文件时不再先扫描整个 root 去建立全局摘要，
+    /// 而是等用户真正看到某个 tile 时再补这块的信息。
+    fn ensure_hierarchy_tile_layer_hints(&mut self, visible_tiles: &[TileId]) {
+        let Some(source) = self.hierarchy_tile_source.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let missing_tiles: HashSet<_> = visible_tiles
+            .iter()
+            .copied()
+            .filter(|tile_id| !self.hierarchy_tile_layer_hints.contains_key(tile_id))
+            .collect();
+        if missing_tiles.is_empty() {
+            return;
+        }
+
+        let hints = build_hierarchy_tile_layer_hints_for_tiles(
+            &source.bundle,
+            source.base_options,
+            &self.tile_grid,
+            &missing_tiles,
+        );
+        for tile_id in missing_tiles {
+            self.hierarchy_tile_layer_hints
+                .insert(tile_id, hints.get(&tile_id).cloned().unwrap_or_default());
         }
     }
 
     /// 把当前视图仍然缺失的 `tile + layer` 键放进待构建队列。
     fn enqueue_pending_tile_build(&mut self, tile_key: TileCacheKey) {
         if self.tile_vertex_cache.contains_key(&tile_key)
+            || self.in_flight_hierarchy_tile_builds.contains(&tile_key)
             || self
                 .pending_tile_builds
                 .iter()
@@ -1365,6 +1998,17 @@ impl Renderer {
         hatch_style: HatchStylePreset,
         build_budget: usize,
     ) {
+        if self.hierarchy_tile_source.is_some() {
+            self.dispatch_pending_hierarchy_tile_builds(
+                zoom,
+                draw_mode,
+                layer_draw_modes,
+                hatch_style,
+                build_budget,
+            );
+            return;
+        }
+
         self.cache_access_tick = self.cache_access_tick.wrapping_add(1);
         let current_tick = self.cache_access_tick;
         let mut built = 0usize;
@@ -1401,8 +2045,88 @@ impl Renderer {
                 current_tick,
             ) {
                 self.tile_vertex_cache.insert(pending.tile_key, entry);
+            } else {
+                self.empty_tile_keys.insert(pending.tile_key);
             }
             built += 1;
+
+            if !self
+                .pending_tile_builds
+                .iter()
+                .any(|item| item.tile_key.layer == active_layer)
+            {
+                self.active_progressive_layer = None;
+            }
+        }
+    }
+
+    /// direct hierarchy 模式下，把 pending `tile + layer` 任务发给后台 worker。
+    fn dispatch_pending_hierarchy_tile_builds(
+        &mut self,
+        zoom: f32,
+        draw_mode: ClosedShapeDrawMode,
+        layer_draw_modes: &BTreeMap<LayerId, ClosedShapeDrawMode>,
+        hatch_style: HatchStylePreset,
+        build_budget: usize,
+    ) {
+        let Some(source) = self.hierarchy_tile_source.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let mut dispatched = 0usize;
+
+        while dispatched < build_budget {
+            let Some(active_layer) = next_active_progressive_layer(
+                self.active_progressive_layer,
+                &self.pending_tile_builds,
+            ) else {
+                self.active_progressive_layer = None;
+                break;
+            };
+            self.active_progressive_layer = Some(active_layer);
+            let Some(pending) =
+                pop_next_pending_for_layer(&mut self.pending_tile_builds, active_layer)
+            else {
+                self.active_progressive_layer = None;
+                break;
+            };
+            if pending.view_revision != self.view_revision {
+                self.total_stale_drops += 1;
+                continue;
+            }
+            if self.tile_vertex_cache.contains_key(&pending.tile_key)
+                || self.empty_tile_keys.contains(&pending.tile_key)
+                || self
+                    .in_flight_hierarchy_tile_builds
+                    .contains(&pending.tile_key)
+            {
+                continue;
+            }
+
+            let effective_mode = layer_draw_modes
+                .get(&pending.tile_key.layer)
+                .copied()
+                .unwrap_or(draw_mode);
+            let effective_hatch_style = self
+                .layer_hatch_styles
+                .get(&pending.tile_key.layer)
+                .copied()
+                .unwrap_or(hatch_style);
+            let task = HierarchyTileBuildTask {
+                view_revision: self.view_revision,
+                tile_key: pending.tile_key,
+                source: Arc::clone(&source),
+                zoom,
+                effective_mode,
+                effective_hatch_style,
+                tile_bounds: self.tile_grid.tile_bounds(pending.tile_key.tile_id),
+            };
+
+            if self.hierarchy_tile_workers.task_sender.send(task).is_err() {
+                break;
+            }
+            self.in_flight_hierarchy_tile_builds
+                .insert(pending.tile_key);
+            dispatched += 1;
 
             if !self
                 .pending_tile_builds
@@ -1424,6 +2148,28 @@ impl Renderer {
         hatch_style: HatchStylePreset,
         current_tick: u64,
     ) -> Option<TileCacheEntry> {
+        if let Some(source) = &self.hierarchy_tile_source {
+            let tile_bounds = self.tile_grid.tile_bounds(tile_key.tile_id);
+            let effective_mode = layer_draw_modes
+                .get(&tile_key.layer)
+                .copied()
+                .unwrap_or(draw_mode);
+            let effective_hatch_style = self
+                .layer_hatch_styles
+                .get(&tile_key.layer)
+                .copied()
+                .unwrap_or(hatch_style);
+            let vertices = build_hierarchy_tile_vertices(
+                source,
+                tile_key,
+                zoom,
+                effective_mode,
+                effective_hatch_style,
+                tile_bounds,
+            );
+            return create_tile_cache_entry(&self.device, &vertices, current_tick);
+        }
+
         let shape_indices: Vec<_> = self
             .tile_grid
             .shape_indices_for_tile_layer(tile_key.tile_id, tile_key.layer)
@@ -1465,6 +2211,125 @@ impl Renderer {
             );
         }
         create_tile_cache_entry(&self.device, &vertices, current_tick)
+    }
+
+    /// 统计当前视图如果“不做静态合批”，实际需要多少段 draw。
+    ///
+    /// 这个值比 `visible_tile_keys.len()` 更接近 GPU 真实负担，
+    /// 因为单个 cache entry 也可能因为 buffer 上限被拆成多段。
+    fn visible_draw_segment_count_for_current_view(&self) -> usize {
+        self.visible_tile_keys
+            .iter()
+            .filter_map(|tile_key| self.tile_vertex_cache.get(tile_key))
+            .map(|entry| entry.vertex_buffers.len())
+            .sum()
+    }
+
+    /// 在静态 direct hierarchy 视图下，建立一份“整屏显示批处理”。
+    ///
+    /// 这里依然复用第一层 tile cache 里的 GPU buffer，
+    /// 只是通过 `copy_buffer_to_buffer` 把当前可见集重新打包成少量大 buffer，
+    /// 以减少静态帧的 draw call 和 vertex buffer 绑定次数。
+    fn ensure_visible_display_batch(&mut self, encoder: &mut wgpu::CommandEncoder, enabled: bool) {
+        if !enabled {
+            self.visible_display_batch = None;
+            return;
+        }
+
+        let source_hash = hash_visible_tile_keys(&self.visible_tile_keys);
+        if self.visible_display_batch.as_ref().is_some_and(|batch| {
+            batch.source_hash == source_hash && batch.source_len == self.visible_tile_keys.len()
+        }) {
+            return;
+        }
+
+        let max_buffer_size = self.device.limits().max_buffer_size as usize;
+        let vertex_size = std::mem::size_of::<LineVertex>();
+        let max_vertices_per_buffer =
+            max_vertices_per_buffer_for_limit(max_buffer_size, vertex_size);
+        let segment_vertex_counts: Vec<usize> = self
+            .visible_tile_keys
+            .iter()
+            .filter_map(|tile_key| self.tile_vertex_cache.get(tile_key))
+            .flat_map(|entry| {
+                entry
+                    .vertex_buffers
+                    .iter()
+                    .map(|segment| segment.vertex_count as usize)
+            })
+            .collect();
+        let batch_vertex_counts =
+            batch_visible_vertex_segments(&segment_vertex_counts, max_vertices_per_buffer);
+        if batch_vertex_counts.is_empty() {
+            self.visible_display_batch = None;
+            return;
+        }
+
+        let mut vertex_buffers = Vec::with_capacity(batch_vertex_counts.len());
+        let byte_size = batch_vertex_counts
+            .iter()
+            .copied()
+            .map(|count| count * vertex_size)
+            .sum::<usize>();
+        for vertex_count in batch_vertex_counts {
+            vertex_buffers.push(TileCacheBufferSegment {
+                vertex_buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("visible-display-batch-buffer"),
+                    size: (vertex_count * vertex_size) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                vertex_count: vertex_count as u32,
+            });
+        }
+
+        let mut dst_index = 0usize;
+        let mut dst_vertex_offset = 0usize;
+        for tile_key in &self.visible_tile_keys {
+            let Some(entry) = self.tile_vertex_cache.get(tile_key) else {
+                self.visible_display_batch = None;
+                return;
+            };
+            for source_segment in &entry.vertex_buffers {
+                let mut remaining_vertices = source_segment.vertex_count as usize;
+                let mut src_vertex_offset = 0usize;
+                while remaining_vertices > 0 {
+                    let Some(dst_segment) = vertex_buffers.get(dst_index) else {
+                        self.visible_display_batch = None;
+                        return;
+                    };
+                    let dst_capacity = dst_segment.vertex_count as usize;
+                    let dst_remaining = dst_capacity.saturating_sub(dst_vertex_offset);
+                    if dst_remaining == 0 {
+                        dst_index += 1;
+                        dst_vertex_offset = 0;
+                        continue;
+                    }
+                    let take_vertices = remaining_vertices.min(dst_remaining);
+                    encoder.copy_buffer_to_buffer(
+                        &source_segment.vertex_buffer,
+                        (src_vertex_offset * vertex_size) as u64,
+                        &dst_segment.vertex_buffer,
+                        (dst_vertex_offset * vertex_size) as u64,
+                        (take_vertices * vertex_size) as u64,
+                    );
+                    remaining_vertices -= take_vertices;
+                    src_vertex_offset += take_vertices;
+                    dst_vertex_offset += take_vertices;
+                    if dst_vertex_offset == dst_capacity {
+                        dst_index += 1;
+                        dst_vertex_offset = 0;
+                    }
+                }
+            }
+        }
+
+        self.visible_display_batch = Some(VisibleDisplayBatch {
+            source_hash,
+            source_len: self.visible_tile_keys.len(),
+            vertex_buffers,
+            byte_size,
+        });
     }
 }
 
@@ -1580,7 +2445,7 @@ fn create_tile_cache_entry(
             vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tile-layer-vertex-buffer"),
                 contents: bytemuck::cast_slice(chunk),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_SRC,
             }),
             vertex_count: chunk.len() as u32,
         });
@@ -1591,6 +2456,79 @@ fn create_tile_cache_entry(
         byte_size: std::mem::size_of_val(vertices),
         last_used_tick,
     })
+}
+
+fn build_hierarchy_tile_layer_hints_for_tiles(
+    bundle: &LayoutBundle,
+    options: LayoutViewBuildOptions,
+    tile_grid: &TileGridIndex,
+    requested_tiles: &HashSet<TileId>,
+) -> HashMap<TileId, Vec<LayerId>> {
+    if requested_tiles.is_empty() {
+        return HashMap::new();
+    }
+
+    let query_bounds = requested_tiles
+        .iter()
+        .copied()
+        .map(|tile_id| tile_grid.tile_bounds(tile_id))
+        .reduce(|acc, bounds| acc.union(bounds))
+        .expect("requested tiles are non-empty");
+    let mut tile_layers_seen: HashMap<TileId, BTreeSet<LayerId>> = HashMap::new();
+    let _ = visit_layout_shape_bounds_in_view(
+        bundle,
+        options.with_visible_world_bounds(Some(query_bounds)),
+        |layer, _hierarchy_level, bounds| {
+            for tile_id in tile_grid.tile_ids_for_bounds(bounds) {
+                if !requested_tiles.contains(&tile_id) {
+                    continue;
+                }
+                tile_layers_seen.entry(tile_id).or_default().insert(layer);
+            }
+        },
+    );
+    tile_layers_seen
+        .into_iter()
+        .map(|(tile_id, layers)| (tile_id, layers.into_iter().collect()))
+        .collect()
+}
+
+fn build_hierarchy_tile_vertices(
+    source: &HierarchyTileSource,
+    tile_key: TileCacheKey,
+    zoom: f32,
+    effective_mode: ClosedShapeDrawMode,
+    effective_hatch_style: HatchStylePreset,
+    tile_bounds: crate::scene::Bounds,
+) -> Vec<LineVertex> {
+    let mut vertices = Vec::new();
+    let scaled_tile_bounds = crate::scene::Bounds::new(
+        tile_bounds.min_x * zoom,
+        tile_bounds.min_y * zoom,
+        tile_bounds.max_x * zoom,
+        tile_bounds.max_y * zoom,
+    );
+    let _ = visit_layout_shapes_in_view(
+        &source.bundle,
+        source
+            .base_options
+            .with_visible_world_bounds(Some(tile_bounds))
+            .with_layer_filter(Some(tile_key.layer)),
+        |shape| {
+            emit_scaled_shape_vertices(
+                &mut vertices,
+                shape.layer,
+                &shape.points,
+                shape.closed,
+                shape.stroke_width_world,
+                zoom,
+                effective_mode,
+                Some(scaled_tile_bounds),
+                effective_hatch_style,
+            );
+        },
+    );
+    vertices
 }
 
 fn max_vertices_per_buffer_for_limit(max_buffer_size: usize, vertex_size: usize) -> usize {
@@ -2030,25 +2968,41 @@ fn refresh_progressive_queue_incremental(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     use glam::Vec2;
 
-    use crate::scene::LayerId;
+    use crate::{
+        camera::Camera2D,
+        layout::{
+            LayoutBundle, LayoutCell, LayoutCellId, LayoutShape, LayoutView,
+            LayoutViewBuildOptions, LayoutViewMetadata,
+        },
+        renderer::geometry::{
+            ClosedShapeDrawMode, DEFAULT_HATCH_SPACING, DEFAULT_HATCH_STYLE_PRESET,
+            DEFAULT_HATCH_WIDTH, HatchParams, build_render_cache_key_with_hatch_styles,
+        },
+        scene::{Bounds, LayerId},
+    };
 
     use std::collections::VecDeque;
 
     use super::{
-        ActiveLayerProgressMode, LayerAdaptiveBypassConfig, LayerPendingStats, PendingTileBuild,
-        RenderDebugStats, TileCacheKey, active_layer_pending_count, advance_active_display_budget,
+        ActiveLayerProgressMode, HierarchyTileSource, LayerAdaptiveBypassConfig, LayerPendingStats,
+        PendingTileBuild, RenderDebugStats, TileCacheKey, active_layer_pending_count,
+        advance_active_display_budget, batch_visible_vertex_segments,
+        build_hierarchy_tile_layer_hints_for_tiles, build_hierarchy_tile_vertices,
         compute_effective_build_budget, compute_revealed_layers_for_display,
-        effective_build_budget_for_active_layer, enqueue_unique_pending,
-        max_vertices_per_buffer_for_limit, merge_requested_tile_keys_for_incremental_pan,
-        next_active_progressive_layer, pop_next_pending_for_layer, refresh_progressive_queue,
+        effective_build_budget_for_active_layer, effective_draw_mode_for_current_view,
+        effective_tile_grid_divisions, enqueue_unique_pending, max_vertices_per_buffer_for_limit,
+        merge_requested_tile_keys_for_incremental_pan, next_active_progressive_layer,
+        pop_next_pending_for_layer, quantize_zoom_for_tile_cache, refresh_progressive_queue,
         refresh_progressive_queue_incremental, requested_layers_in_order,
         select_tile_eviction_victims, should_bypass_progressive_for_layer,
         should_display_cached_tile_key, should_freeze_interaction_view,
-        stabilize_visible_tile_keys_during_transition, tile_scissor_rect,
+        should_skip_static_cache_refresh, should_use_per_tile_scissor,
+        should_use_static_visible_display_batch, stabilize_visible_tile_keys_during_transition,
+        tile_scissor_rect,
     };
 
     #[test]
@@ -2140,6 +3094,236 @@ mod tests {
 
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn hierarchy_tile_hints_only_keep_layers_present_in_requested_tiles() {
+        let root_id = LayoutCellId::new(1);
+        let layer_a = LayerId {
+            layer: 1,
+            datatype: 0,
+        };
+        let layer_b = LayerId {
+            layer: 2,
+            datatype: 0,
+        };
+        let root = std::sync::Arc::new(LayoutCell::new(
+            root_id,
+            "root",
+            vec![
+                LayoutShape::rectangle(layer_a, Bounds::new(0.0, 0.0, 10.0, 10.0)),
+                LayoutShape::rectangle(layer_b, Bounds::new(80.0, 80.0, 90.0, 90.0)),
+            ],
+            vec![],
+        ));
+        let bundle = LayoutBundle::new(
+            vec![root],
+            vec![LayoutView::new(LayoutViewMetadata::new("root", root_id))],
+        )
+        .expect("bundle");
+        let grid = super::TileGridIndex::build_for_bounds(Bounds::new(0.0, 0.0, 100.0, 100.0), 4);
+
+        let left_tile = super::TileId { col: 0, row: 0 };
+        let hints = build_hierarchy_tile_layer_hints_for_tiles(
+            &bundle,
+            LayoutViewBuildOptions::new(root_id, 0, 0)
+                .with_visible_world_bounds(Some(Bounds::new(0.0, 0.0, 100.0, 100.0))),
+            &grid,
+            &HashSet::from([left_tile]),
+        );
+
+        let right_tile = super::TileId { col: 3, row: 3 };
+        assert_eq!(hints.get(&left_tile), Some(&vec![layer_a]));
+        assert!(!hints.contains_key(&right_tile));
+    }
+
+    #[test]
+    fn hierarchy_tile_vertices_match_scene_tile_builder_for_same_tile() {
+        let root_id = LayoutCellId::new(11);
+        let layer = LayerId {
+            layer: 7,
+            datatype: 0,
+        };
+        let root = std::sync::Arc::new(LayoutCell::new(
+            root_id,
+            "root",
+            vec![LayoutShape::rectangle(
+                layer,
+                Bounds::new(20.0, 20.0, 80.0, 80.0),
+            )],
+            vec![],
+        ));
+        let bundle = LayoutBundle::new(
+            vec![root],
+            vec![LayoutView::new(LayoutViewMetadata::new("root", root_id))],
+        )
+        .expect("bundle");
+        let options = LayoutViewBuildOptions::new(root_id, 0, 0);
+        let scene = crate::layout::build_layout_view_scene(&bundle, options).expect("scene");
+        let tile_grid = crate::renderer::geometry::TileGridIndex::build_for_bounds(
+            Bounds::new(0.0, 0.0, 100.0, 100.0),
+            4,
+        );
+        let tile_id = crate::renderer::geometry::TileId { col: 1, row: 1 };
+        let tile_bounds = tile_grid.tile_bounds(tile_id);
+        let source = HierarchyTileSource {
+            bundle,
+            base_options: options,
+            layer_ids: vec![layer],
+            total_shape_estimate: 1,
+        };
+        let tile_key = TileCacheKey {
+            scene_revision: 1,
+            zoom_bits: 0.5f32.to_bits(),
+            tile_id,
+            layer,
+            effective_mode_tag: ClosedShapeDrawMode::HatchOutline.as_tag(),
+            hatch_signature: crate::renderer::geometry::build_hatch_signature(
+                crate::renderer::geometry::HatchParams {
+                    spacing: crate::renderer::geometry::DEFAULT_HATCH_SPACING,
+                    width: crate::renderer::geometry::DEFAULT_HATCH_WIDTH,
+                },
+            ),
+            effective_hatch_style_tag: crate::renderer::geometry::HatchStylePreset::LeftDiagonal
+                .as_tag(),
+        };
+
+        let expected = crate::renderer::geometry::build_scaled_scene_vertices_for_tile(
+            &scene,
+            0.5,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &[0],
+            ClosedShapeDrawMode::HatchOutline,
+            Some(tile_bounds),
+            &BTreeMap::new(),
+            crate::renderer::geometry::HatchStylePreset::LeftDiagonal,
+        );
+        let actual = build_hierarchy_tile_vertices(
+            &source,
+            tile_key,
+            0.5,
+            ClosedShapeDrawMode::HatchOutline,
+            crate::renderer::geometry::HatchStylePreset::LeftDiagonal,
+            tile_bounds,
+        );
+
+        assert_eq!(actual.len(), expected.len());
+    }
+
+    #[test]
+    fn direct_hierarchy_far_zoom_suppresses_fill_to_outline() {
+        assert_eq!(
+            effective_draw_mode_for_current_view(ClosedShapeDrawMode::HatchOutline, true, 0.01),
+            ClosedShapeDrawMode::Outline
+        );
+        assert_eq!(
+            effective_draw_mode_for_current_view(ClosedShapeDrawMode::Hatch, true, 0.01),
+            ClosedShapeDrawMode::Outline
+        );
+        assert_eq!(
+            effective_draw_mode_for_current_view(ClosedShapeDrawMode::HatchOutline, true, 0.2),
+            ClosedShapeDrawMode::HatchOutline
+        );
+    }
+
+    #[test]
+    fn direct_hierarchy_quantizes_nearby_zooms_into_same_tile_cache_bucket() {
+        let base = quantize_zoom_for_tile_cache(1.0, true);
+        let nearby = quantize_zoom_for_tile_cache(1.03, true);
+        let farther = quantize_zoom_for_tile_cache(1.2, true);
+
+        assert_eq!(base.to_bits(), nearby.to_bits());
+        assert_ne!(base.to_bits(), farther.to_bits());
+        assert_eq!(quantize_zoom_for_tile_cache(1.03, false), 1.03);
+    }
+
+    #[test]
+    fn direct_hierarchy_uses_coarser_internal_tile_grid() {
+        assert_eq!(effective_tile_grid_divisions(8, true), 1);
+        assert_eq!(effective_tile_grid_divisions(4, true), 1);
+        assert_eq!(effective_tile_grid_divisions(2, true), 1);
+        assert_eq!(effective_tile_grid_divisions(8, false), 8);
+    }
+
+    #[test]
+    fn direct_hierarchy_skips_per_tile_scissor_state_churn() {
+        assert!(!should_use_per_tile_scissor(true));
+        assert!(should_use_per_tile_scissor(false));
+    }
+
+    #[test]
+    fn static_cache_hit_can_skip_scene_cache_refresh_work() {
+        let key = build_render_cache_key_with_hatch_styles(
+            1,
+            &Camera2D::default(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Vec2::ZERO,
+            Vec2::new(100.0, 100.0),
+            Vec2::new(100.0, 100.0),
+            ClosedShapeDrawMode::Outline,
+            HatchParams {
+                spacing: DEFAULT_HATCH_SPACING,
+                width: DEFAULT_HATCH_WIDTH,
+            },
+            DEFAULT_HATCH_STYLE_PRESET,
+        );
+        assert!(should_skip_static_cache_refresh(Some(key), key, true, 0, 0));
+        assert!(!should_skip_static_cache_refresh(None, key, true, 0, 0));
+        assert!(!should_skip_static_cache_refresh(
+            Some(key),
+            key,
+            false,
+            0,
+            0
+        ));
+        assert!(!should_skip_static_cache_refresh(
+            Some(key),
+            key,
+            true,
+            1,
+            0
+        ));
+        assert!(!should_skip_static_cache_refresh(
+            Some(key),
+            key,
+            true,
+            0,
+            1
+        ));
+    }
+
+    #[test]
+    fn static_display_batch_only_enables_for_fully_stable_direct_hierarchy_views() {
+        assert!(should_use_static_visible_display_batch(
+            true, false, 4, 0, 0
+        ));
+        assert!(!should_use_static_visible_display_batch(
+            false, false, 4, 0, 0
+        ));
+        assert!(!should_use_static_visible_display_batch(
+            true, true, 4, 0, 0
+        ));
+        assert!(!should_use_static_visible_display_batch(
+            true, false, 0, 0, 0
+        ));
+        assert!(!should_use_static_visible_display_batch(
+            true, false, 4, 1, 0
+        ));
+        assert!(!should_use_static_visible_display_batch(
+            true, false, 4, 0, 1
+        ));
+    }
+
+    #[test]
+    fn static_display_batch_merges_visible_segments_until_buffer_limit() {
+        let merged = batch_visible_vertex_segments(&[3, 3, 3, 3, 3], 6);
+        assert_eq!(merged, vec![6, 6, 3]);
+
+        let merged = batch_visible_vertex_segments(&[4, 4, 1, 2], 8);
+        assert_eq!(merged, vec![8, 3]);
     }
 
     #[test]

@@ -14,7 +14,10 @@ use std::{
 use glam::Vec2;
 
 use crate::scene::{Bounds, LayerId};
-pub use view_builder::{LayoutViewBuildError, LayoutViewBuildOptions, build_layout_view_scene};
+pub use view_builder::{
+    LayoutViewBuildError, LayoutViewBuildOptions, build_layout_view_scene,
+    visit_layout_shape_bounds_in_view, visit_layout_shapes_in_view,
+};
 
 /// 稳定的 cell 标识。
 ///
@@ -226,24 +229,29 @@ impl LayoutInstance {
         self
     }
 
+    /// 被引用目标 cell 的 id。
     pub fn target_cell_id(&self) -> LayoutCellId {
         self.target_cell_id
     }
 
+    /// 这个实例在父 cell 局部坐标中的 footprint。
     pub fn local_bounds(&self) -> Bounds {
         self.local_bounds
     }
 
+    /// 这个实例自身的局部放置变换。
     pub fn transform(&self) -> LayoutTransform {
         self.transform
     }
 
+    /// 如果这是阵列实例，返回其重复放置语义。
     pub fn repetition(&self) -> Option<&LayoutRepetition> {
         self.repetition.as_ref()
     }
 }
 
 impl LayoutTransform {
+    /// 单位放置变换。
     pub fn identity() -> Self {
         Self {
             translation: Vec2::ZERO,
@@ -255,6 +263,7 @@ impl LayoutTransform {
 }
 
 impl LayoutRepetition {
+    /// 构造一个规则阵列重复。
     pub fn regular_grid(columns: u32, rows: u32, column_step: Vec2, row_step: Vec2) -> Self {
         assert!(columns > 0, "columns 必须大于 0。");
         assert!(rows > 0, "rows 必须大于 0。");
@@ -269,6 +278,7 @@ impl LayoutRepetition {
 }
 
 impl LayoutCell {
+    /// 创建一个 cell，并顺手整理局部 bounds 与 layer 摘要。
     pub fn new(
         id: LayoutCellId,
         name: impl Into<String>,
@@ -288,44 +298,54 @@ impl LayoutCell {
         }
     }
 
+    /// 稳定 cell id。
     pub fn id(&self) -> LayoutCellId {
         self.id
     }
 
+    /// cell 名称。
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// 本 cell 直接拥有的局部 shape。
     pub fn local_shapes(&self) -> &[LayoutShape] {
         &self.local_shapes
     }
 
+    /// 共享所有权版本的局部 shape 句柄。
     pub fn local_shapes_handle(&self) -> Arc<[LayoutShape]> {
         Arc::clone(&self.local_shapes)
     }
 
+    /// 本 cell 直接引用的子实例。
     pub fn instances(&self) -> &[LayoutInstance] {
         &self.instances
     }
 
+    /// 局部 shape 数量。
     pub fn local_shape_count(&self) -> usize {
         self.local_shapes.len()
     }
 
+    /// 局部实例数量。
     pub fn local_instance_count(&self) -> usize {
         self.instances.len()
     }
 
+    /// 本 cell 自己内容的局部包围盒。
     pub fn local_bounds(&self) -> Option<Bounds> {
         self.local_bounds
     }
 
+    /// 本 cell 局部 shape 出现过的 layer 集合。
     pub fn local_layers(&self) -> &[LayerId] {
         &self.local_layers
     }
 }
 
 impl LayoutViewMetadata {
+    /// 创建一个 root view 元数据。
     pub fn new(name: impl Into<String>, root_cell_id: LayoutCellId) -> Self {
         Self {
             name: name.into(),
@@ -333,30 +353,39 @@ impl LayoutViewMetadata {
         }
     }
 
+    /// view 名称。
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// 当前 view 对应的 root cell。
     pub fn root_cell_id(&self) -> LayoutCellId {
         self.root_cell_id
     }
 }
 
 impl LayoutView {
+    /// 创建一个可切换 root view。
     pub fn new(metadata: LayoutViewMetadata) -> Self {
         Self { metadata }
     }
 
+    /// 读取 view 元数据。
     pub fn metadata(&self) -> &LayoutViewMetadata {
         &self.metadata
     }
 }
 
 impl LayoutBundle {
+    /// 空 bundle。
     pub fn empty() -> Self {
         Self::default()
     }
 
+    /// 创建 bundle，并验证：
+    /// - cell id 不重复
+    /// - 每个 view 的 root 存在
+    /// - 每个 instance target 都存在
     pub fn new(
         cells: Vec<Arc<LayoutCell>>,
         views: Vec<LayoutView>,
@@ -395,35 +424,45 @@ impl LayoutBundle {
         })
     }
 
+    /// 全部 cell 映射表。
     pub fn cells(&self) -> &BTreeMap<LayoutCellId, Arc<LayoutCell>> {
         &self.cells
     }
 
+    /// 按 id 读取 cell。
     pub fn cell(&self, id: LayoutCellId) -> Option<&LayoutCell> {
         self.cells.get(&id).map(Arc::as_ref)
     }
 
+    /// 当前 bundle 可切换的 root views。
     pub fn views(&self) -> &[LayoutView] {
         &self.views
     }
 
+    /// 当前选中的 view 下标。
     pub fn selected_index(&self) -> usize {
         self.selected
     }
 
+    /// 当前选中的 view。
     pub fn selected_view(&self) -> Option<&LayoutView> {
         self.views.get(self.selected)
     }
 
+    /// 当前选中 view 的 root 元数据。
     pub fn selected_root_metadata(&self) -> Option<&LayoutViewMetadata> {
         self.selected_view().map(LayoutView::metadata)
     }
 
+    /// 当前选中 view 的 root cell。
     pub fn selected_root_cell(&self) -> Option<&LayoutCell> {
         let root_id = self.selected_root_metadata()?.root_cell_id();
         self.cell(root_id)
     }
 
+    /// 切换当前选中的 view。
+    ///
+    /// 返回值表示是否真的发生了切换。
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.views.len() || index == self.selected {
             return false;

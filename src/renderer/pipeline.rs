@@ -21,6 +21,13 @@ use super::geometry::LineVertex;
 /// 当前我们让 tile 顶点缓存保存的是“缩放后的逻辑屏幕坐标”，
 /// 但还没有叠加相机平移和画布 origin。
 /// 这两个量放进 uniform 后，平移时可以复用更多 tile buffer。
+///
+/// 这也是当前缓存体系一个非常重要的取舍：
+/// - CPU 负责把 shape 变成“缩放后的局部屏幕坐标”
+/// - shader 再负责补最后一层平移 / 视口归一化
+///
+/// 这样能显著提升 pan 场景下的 tile 复用率，
+/// 因为平移不再要求 CPU 重新生成顶点。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct SceneUniform {
@@ -52,7 +59,9 @@ pub struct SceneUniform {
 
 /// 场景渲染 pipeline 封装。
 pub struct ScenePipeline {
+    /// 当前 scene 使用的基础 render pipeline。
     render_pipeline: wgpu::RenderPipeline,
+    /// scene uniform 对应的 bind group layout。
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -85,6 +94,16 @@ impl ScenePipeline {
             push_constant_ranges: &[],
         });
 
+        // 当前 pipeline 故意保持“只有一条基础 scene pipeline”的简单结构：
+        // - 不按 layer 建多套 pipeline
+        // - 不按 hatch style 建多套 pipeline
+        // - 不引入额外的 depth / stencil 复杂度
+        //
+        // 这些语义尽量通过：
+        // - 顶点属性
+        // - uniform
+        // - shader 分支
+        // 来表达，便于缓存和 draw 调度保持统一。
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene-pipeline"),
             layout: Some(&layout),
@@ -109,6 +128,8 @@ impl ScenePipeline {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
+                    // 目前 scene 与 egui 叠加的方式比较直接：
+                    // scene 先画，egui 后画，所以 scene 这里启用普通 alpha blending 即可。
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],

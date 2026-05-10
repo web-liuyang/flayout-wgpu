@@ -55,8 +55,63 @@ use crate::{
     ui::draw_ui,
 };
 
+fn filter_hidden_layers_for_layer_ids(
+    config: &ViewerConfig,
+    layers: &[LayerId],
+) -> BTreeSet<LayerId> {
+    let existing: BTreeSet<_> = layers.iter().copied().collect();
+    config
+        .hidden_layers
+        .iter()
+        .map(|layer| layer.to_runtime())
+        .filter(|layer| existing.contains(layer))
+        .collect()
+}
+
+fn filter_layer_draw_modes_for_layer_ids(
+    config: &ViewerConfig,
+    layers: &[LayerId],
+) -> BTreeMap<LayerId, ClosedShapeDrawMode> {
+    let existing: BTreeSet<_> = layers.iter().copied().collect();
+    config
+        .layer_draw_modes
+        .iter()
+        .filter_map(|entry| {
+            let layer = entry.layer.to_runtime();
+            existing
+                .contains(&layer)
+                .then_some((layer, entry.mode.to_runtime()))
+        })
+        .collect()
+}
+
+fn filter_layer_hatch_styles_for_layer_ids(
+    config: &ViewerConfig,
+    layers: &[LayerId],
+) -> BTreeMap<LayerId, HatchStylePreset> {
+    let existing: BTreeSet<_> = layers.iter().copied().collect();
+    config
+        .layer_hatch_styles
+        .iter()
+        .filter_map(|entry| {
+            let layer = entry.layer.to_runtime();
+            existing
+                .contains(&layer)
+                .then_some((layer, entry.style.to_runtime()))
+        })
+        .collect()
+}
+
 const INITIAL_LAYOUT_WORKSET_SHAPE_BUDGET: u64 = 3_000_000;
 const INITIAL_LAYOUT_WORKSET_POINT_BUDGET: u64 = 20_000_000;
+/// 当层级范围预估成本超过这个阈值时，app 不再先构完整 workset，
+/// 而是切到 renderer 侧 direct hierarchy tile 路径。
+///
+/// 这两个阈值和上面的 initial workset budget 看起来接近，是有意的：
+/// - 小场景：直接构临时 Scene，逻辑简单，交互更直接
+/// - 大场景：避免 app 层先常驻一份巨大 flat Scene
+const DIRECT_LAYOUT_TILE_SOURCE_SHAPE_THRESHOLD: u64 = 3_000_000;
+const DIRECT_LAYOUT_TILE_SOURCE_POINT_THRESHOLD: u64 = 20_000_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LayoutHierarchyLevelCost {
@@ -188,6 +243,11 @@ fn should_rebuild_layout_workset_for_camera(
     covered_visible_world_bounds: Option<Bounds>,
     covered_zoom: Option<f32>,
 ) -> bool {
+    // 这层判定本质上是在回答一个问题：
+    // “当前 camera 变化，是否已经足以让旧 workset 的视口裁剪 / screen-space LOD 失真？”
+    //
+    // 如果答案还是否，我们宁愿先复用旧 workset，
+    // 把交互流畅度让给 pan/zoom，而不是每一下都同步重建。
     let Some(current_visible_world_bounds) = current_visible_world_bounds else {
         return false;
     };
@@ -235,6 +295,17 @@ pub fn fill_missing_layer_hatch_styles(
     }
 }
 
+pub fn fill_missing_layer_hatch_styles_for_layers(
+    layers: &[LayerId],
+    layer_hatch_styles: &mut BTreeMap<LayerId, HatchStylePreset>,
+) {
+    for (index, layer) in layers.iter().copied().enumerate() {
+        layer_hatch_styles
+            .entry(layer)
+            .or_insert_with(|| alternating_default_hatch_style(index));
+    }
+}
+
 /// 用一个保守的启发式判断“当前 scene 是否算小版图”。
 ///
 /// 这里故意同时看：
@@ -266,11 +337,17 @@ pub fn recommended_initial_hierarchy_level_range(scene: &Scene) -> (u32, u32) {
 
 /// Viewer 应用状态。
 pub struct ViewerApp {
+    /// winit 创建的主窗口句柄。
     window: Option<Arc<Window>>,
+    /// 主窗口 id，用来过滤窗口事件。
     window_id: Option<WindowId>,
+    /// GPU renderer；窗口创建前保持为空。
     renderer: Option<Renderer>,
+    /// egui 全局上下文。
     egui_ctx: egui::Context,
+    /// egui 和 winit 之间的事件桥接状态。
     egui_state: Option<EguiWinitState>,
+    /// 当前文件可切换的 scene 视图集合。
     scene_bundle: SceneBundle,
     /// GDS 新内存架构下的分层数据源。
     ///
@@ -282,21 +359,51 @@ pub struct ViewerApp {
     /// 在旧路径下，它通常等于选中 scene 经过 level range 过滤后的结果；
     /// 在新路径下，它是从 `LayoutBundle` 按需构建出来的临时 workset。
     scene: Arc<Scene>,
+    /// 当前场景真实可见层集合的轻量摘要。
+    ///
+    /// direct hierarchy tile 路径下，app 可能不会长期持有完整 Scene，
+    /// 这时 UI 仍然需要靠它来驱动 layer 列表和持久化过滤。
+    scene_layer_ids: Vec<LayerId>,
+    /// 当前场景的 bounds 提示。
+    ///
+    /// 对 direct hierarchy 路径尤其重要，因为 fit / UI 不能再假设一定有完整 Scene 可读。
+    scene_bounds_hint: Option<Bounds>,
+    /// 是否切到了 renderer 侧 direct hierarchy tile 渲染。
+    ///
+    /// `false`：app 先构一个临时 Scene/workset，再交给 renderer。
+    /// `true`：app 只维护 hierarchy source 摘要，renderer 按 tile 向 hierarchy 要几何。
+    hierarchy_tile_render_active: bool,
+    /// 当前交互相机。
     camera: Camera2D,
+    /// 文件加载状态。
     load_state: LoadState,
+    /// 当前打开或待打开的版图路径。
     layout_path: String,
+    /// 是否已经针对当前 scene 初始化过相机。
     initialized_camera: bool,
+    /// 中央画布的逻辑尺寸。
     canvas_size: Vec2,
+    /// 当前被隐藏的 layer 集合。
     hidden_layers: BTreeSet<LayerId>,
+    /// per-layer 闭合图元显示模式覆盖。
     layer_draw_modes: BTreeMap<LayerId, ClosedShapeDrawMode>,
+    /// per-layer hatch 风格覆盖。
     layer_hatch_styles: BTreeMap<LayerId, HatchStylePreset>,
+    /// 滑动窗口帧时间统计。
     frame_stats: FrameStats,
+    /// 上一帧绘制完成时刻。
     last_frame_at: Option<Instant>,
+    /// 当前帧 renderer 调试统计。
     render_debug_stats: RenderDebugStats,
+    /// 多帧 renderer 调试趋势历史。
     render_stats_history: RenderStatsHistory,
+    /// 启动后待恢复的一份持久化配置快照。
     pending_restore_config: Option<ViewerConfig>,
+    /// 当前 tile grid 粒度设置。
     tile_grid_divisions: u32,
+    /// 当前全局闭合图元画法。
     draw_mode: ClosedShapeDrawMode,
+    /// 当前全局 hatch 参数。
     hatch_params: HatchParams,
     /// 当前显示层级范围的下界。
     min_hierarchy_level: u32,
@@ -307,14 +414,29 @@ pub struct ViewerApp {
     /// 对旧扁平路径，它来自当前选中 scene 的 `max_hierarchy_level()`；
     /// 对新分层路径，它来自 root cell 子树的递归深度，而不是当前 workset。
     available_max_hierarchy_level: u32,
+    /// tile cache 条目容量上限。
     tile_cache_capacity: usize,
+    /// 全局 progressive bypass 阈值。
     progressive_bypass_threshold: usize,
+    /// per-layer entry bypass 阈值。
     layer_bypass_entry_threshold: usize,
+    /// per-layer work bypass 阈值。
     layer_bypass_work_threshold: usize,
+    /// 最近一次相机交互时间戳。
     last_camera_interaction_at: Option<Instant>,
+    /// 交互冻结视图是否已经落后于真实相机。
     interaction_view_dirty: bool,
+    /// 上一次构建 workset 时实际覆盖的可见世界范围（已经带预取 margin）。
     layout_workset_visible_bounds: Option<Bounds>,
+    /// 上一次构建 workset 时的 zoom。
+    ///
+    /// 视口裁剪本身只看 bounds，但 subtree screen-space LOD 还依赖 zoom，
+    /// 所以相机缩放偏离太多时也需要重建。
     layout_workset_zoom: Option<f32>,
+    /// 交互期间暂缓的 workset 重建请求。
+    ///
+    /// 连续 pan/zoom 时我们先让画面跟手；
+    /// 等交互窗口过去后，再补一次真正的重建。
     layout_workset_rebuild_pending: bool,
     /// 是否已经为当前会话初始化过 hierarchy level range。
     ///
@@ -343,6 +465,9 @@ impl ViewerApp {
             scene_bundle: SceneBundle::empty(),
             layout_bundle: None,
             scene: Arc::new(Scene::empty()),
+            scene_layer_ids: Vec::new(),
+            scene_bounds_hint: None,
+            hierarchy_tile_render_active: false,
             camera: Camera2D::new(),
             load_state: LoadState::Idle,
             layout_path: DEFAULT_LAYOUT_PATH.to_string(),
@@ -402,7 +527,14 @@ impl ViewerApp {
     /// - 对旧扁平路径，用户切 level 时仍然可能希望保留更深层的样式选择
     /// - 对新分层路径，深层 layer 在当前 workset 不出现，不代表它永远不存在
     fn sync_layer_hatch_styles_with_scene(&mut self) {
-        fill_missing_layer_hatch_styles(&self.scene, &mut self.layer_hatch_styles);
+        if self.layout_bundle.is_some() {
+            fill_missing_layer_hatch_styles_for_layers(
+                &self.scene_layer_ids,
+                &mut self.layer_hatch_styles,
+            );
+        } else {
+            fill_missing_layer_hatch_styles(&self.scene, &mut self.layer_hatch_styles);
+        }
     }
 
     /// 用一个只保存 view 名称的轻量 `SceneBundle` 承载层次化 source 的 UI 选择状态。
@@ -591,8 +723,79 @@ impl ViewerApp {
         };
     }
 
+    fn estimated_layout_range_cost(
+        bundle: &LayoutBundle,
+        root_cell_id: LayoutCellId,
+        min_level: u32,
+        max_level: u32,
+    ) -> LayoutHierarchyLevelCost {
+        let level_costs = Self::estimate_layout_root_level_costs(bundle, root_cell_id);
+        let mut total = LayoutHierarchyLevelCost::default();
+        for (index, cost) in level_costs.into_iter().enumerate() {
+            let level = index as u32;
+            if level < min_level || level > max_level {
+                continue;
+            }
+            total.shape_count = total.shape_count.saturating_add(cost.shape_count);
+            total.point_count = total.point_count.saturating_add(cost.point_count);
+        }
+        total
+    }
+
+    fn should_use_direct_hierarchy_tile_render(range_cost: LayoutHierarchyLevelCost) -> bool {
+        range_cost.shape_count > DIRECT_LAYOUT_TILE_SOURCE_SHAPE_THRESHOLD
+            || range_cost.point_count > DIRECT_LAYOUT_TILE_SOURCE_POINT_THRESHOLD
+    }
+
+    fn collect_layout_layers_for_range(
+        bundle: &LayoutBundle,
+        root_cell_id: LayoutCellId,
+        min_level: u32,
+        max_level: u32,
+    ) -> Vec<LayerId> {
+        fn visit(
+            bundle: &LayoutBundle,
+            cell_id: LayoutCellId,
+            level: u32,
+            min_level: u32,
+            max_level: u32,
+            layers: &mut BTreeSet<LayerId>,
+        ) {
+            let Some(cell) = bundle.cell(cell_id) else {
+                return;
+            };
+            if level >= min_level && level <= max_level {
+                layers.extend(cell.local_layers().iter().copied());
+            }
+            if level >= max_level {
+                return;
+            }
+            for instance in cell.instances() {
+                visit(
+                    bundle,
+                    instance.target_cell_id(),
+                    level + 1,
+                    min_level,
+                    max_level,
+                    layers,
+                );
+            }
+        }
+
+        let mut layers = BTreeSet::new();
+        visit(bundle, root_cell_id, 0, min_level, max_level, &mut layers);
+        layers.into_iter().collect()
+    }
+
     /// 根据当前 source 和当前 level range 重新构建运行场景。
     fn rebuild_scene_from_source(&mut self) {
+        // 这一步是 app 层“决定走哪条渲染架构”的核心分叉：
+        // - 小 / 中型场景：直接构一个临时 Scene workset，renderer 继续走老路径
+        // - 大场景：不在 app 层落完整 workset，改让 renderer 按 tile 直接访问 hierarchy
+        //
+        // 这样做的原因很现实：
+        // 继续坚持“所有场景都先扁平化成 Scene”，在大 GDS 上会同时把
+        // Scene / spatial index / tile grid / tile cache 都堆起来，内存很快失控。
         let max_available = self.available_max_hierarchy_level;
         self.min_hierarchy_level = self.min_hierarchy_level.min(max_available);
         self.max_hierarchy_level = self
@@ -600,17 +803,39 @@ impl ViewerApp {
             .min(max_available)
             .max(self.min_hierarchy_level);
 
+        self.hierarchy_tile_render_active = false;
         self.scene = if let Some(layout_bundle) = &self.layout_bundle {
             let visible_world_bounds = self.visible_world_bounds_for_layout_workset();
             let workset_visible_world_bounds = visible_world_bounds.map(|bounds| {
                 expand_layout_workset_visible_bounds(bounds, LAYOUT_WORKSET_PREFETCH_MARGIN_RATIO)
             });
             let subtree_screen_lod = self.subtree_screen_lod_for_layout_workset();
-            layout_bundle
-                .selected_root_metadata()
-                .and_then(|metadata| {
+            if let Some(metadata) = layout_bundle.selected_root_metadata() {
+                let root_cell_id = metadata.root_cell_id();
+                let root_bounds = layout_bundle
+                    .selected_root_cell()
+                    .and_then(|cell| cell.local_bounds());
+                let range_cost = Self::estimated_layout_range_cost(
+                    layout_bundle,
+                    root_cell_id,
+                    self.min_hierarchy_level,
+                    self.max_hierarchy_level,
+                );
+                self.scene_layer_ids = Self::collect_layout_layers_for_range(
+                    layout_bundle,
+                    root_cell_id,
+                    self.min_hierarchy_level,
+                    self.max_hierarchy_level,
+                );
+                self.scene_bounds_hint = root_bounds;
+                self.hierarchy_tile_render_active =
+                    Self::should_use_direct_hierarchy_tile_render(range_cost);
+
+                if self.hierarchy_tile_render_active {
+                    Arc::new(Scene::empty())
+                } else {
                     let mut options = LayoutViewBuildOptions::new(
-                        metadata.root_cell_id(),
+                        root_cell_id,
                         self.min_hierarchy_level,
                         self.max_hierarchy_level,
                     )
@@ -627,11 +852,22 @@ impl ViewerApp {
                             min_collapse_hierarchy_level,
                         );
                     }
-                    build_layout_view_scene(layout_bundle, options).ok()
-                })
-                .map(Arc::new)
-                .unwrap_or_else(|| Arc::new(Scene::empty()))
+                    build_layout_view_scene(layout_bundle, options)
+                        .map(Arc::new)
+                        .unwrap_or_else(|_| Arc::new(Scene::empty()))
+                }
+            } else {
+                self.scene_layer_ids = Vec::new();
+                self.scene_bounds_hint = None;
+                Arc::new(Scene::empty())
+            }
         } else {
+            self.scene_layer_ids = self
+                .scene_bundle
+                .current_scene()
+                .map(Scene::layer_ids)
+                .unwrap_or_default();
+            self.scene_bounds_hint = self.scene_bundle.current_scene().and_then(Scene::bounds);
             let base_scene = self
                 .scene_bundle
                 .current_scene_handle()
@@ -662,6 +898,10 @@ impl ViewerApp {
         } else {
             self.layout_workset_visible_bounds = None;
             self.layout_workset_zoom = None;
+        }
+        if !self.hierarchy_tile_render_active {
+            self.scene_layer_ids = self.scene.layer_ids();
+            self.scene_bounds_hint = self.scene.bounds();
         }
     }
 
@@ -745,10 +985,61 @@ impl ViewerApp {
     /// - scene 过滤逻辑不会散落在多个事件分支里
     /// - renderer 相关的 scene / per-layer 配置刷新顺序更稳定
     fn refresh_filtered_scene_and_renderer(&mut self) {
+        // 这里尽量把“app 的数据准备”和“renderer 的状态同步”绑在一起，
+        // 避免出现：
+        // - app 里的 scene/range 已经变了
+        // - renderer 还保留着旧 tile source / 旧 layer 配置
+        //
+        // 对 direct hierarchy 路径尤其重要，因为这时 renderer 自己持有一份 hierarchy source。
         self.rebuild_scene_from_source();
         self.sync_layer_hatch_styles_with_scene();
+        let subtree_screen_lod = self.subtree_screen_lod_for_layout_workset();
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.update_scene(Arc::clone(&self.scene));
+            if let Some(layout_bundle) = &self.layout_bundle {
+                if self.hierarchy_tile_render_active {
+                    if let (Some(metadata), Some(root_bounds)) = (
+                        layout_bundle.selected_root_metadata(),
+                        self.scene_bounds_hint,
+                    ) {
+                        let range_cost = Self::estimated_layout_range_cost(
+                            layout_bundle,
+                            metadata.root_cell_id(),
+                            self.min_hierarchy_level,
+                            self.max_hierarchy_level,
+                        );
+                        let mut options = LayoutViewBuildOptions::new(
+                            metadata.root_cell_id(),
+                            self.min_hierarchy_level,
+                            self.max_hierarchy_level,
+                        );
+                        if let Some((
+                            world_to_screen_scale,
+                            min_subtree_screen_extent,
+                            min_collapse_hierarchy_level,
+                        )) = subtree_screen_lod
+                        {
+                            options = options.with_subtree_screen_lod(
+                                world_to_screen_scale,
+                                min_subtree_screen_extent,
+                                min_collapse_hierarchy_level,
+                            );
+                        }
+                        renderer.update_hierarchy_tile_source(
+                            layout_bundle.clone(),
+                            options,
+                            self.scene_layer_ids.clone(),
+                            root_bounds,
+                            range_cost.shape_count as usize,
+                        );
+                    } else {
+                        renderer.update_scene(Arc::clone(&self.scene));
+                    }
+                } else {
+                    renderer.update_scene(Arc::clone(&self.scene));
+                }
+            } else {
+                renderer.update_scene(Arc::clone(&self.scene));
+            }
             renderer.set_layer_draw_modes(self.layer_draw_modes.clone());
             renderer.set_layer_hatch_styles(self.layer_hatch_styles.clone());
         }
@@ -761,6 +1052,12 @@ impl ViewerApp {
     }
 
     fn layout_scene_rebuild_needed_for_current_camera(&self) -> bool {
+        // direct hierarchy 模式下，这里只影响“app 是否要重建 workset”；
+        // renderer 自己的 tile cache / visible tile 调度仍然会继续工作。
+        //
+        // 也就是说，这个判定主要保护的是：
+        // - 临时 Scene workset 的构建成本
+        // - subtree screen-space LOD 的更新频率
         if self.layout_bundle.is_none() || !self.initialized_camera {
             return false;
         }
@@ -775,6 +1072,9 @@ impl ViewerApp {
     }
 
     fn refresh_layout_scene_if_camera_requires_rebuild(&mut self) {
+        // 这里是“正确性 vs 交互手感”的折中点：
+        // - 交互中：尽量不打断 pan/zoom，先把 rebuild 标记成 pending
+        // - 停下来：尽快补做真正重建，让可见范围和 LOD 追上相机状态
         let interaction_degraded = should_degrade_interaction_render(
             self.last_camera_interaction_at.map(|last| last.elapsed()),
             INTERACTION_RENDER_DEGRADE_HOLD,
@@ -935,6 +1235,9 @@ impl ViewerApp {
                 self.layout_bundle = None;
                 self.scene_bundle = SceneBundle::empty();
                 self.scene = Arc::new(Scene::empty());
+                self.scene_layer_ids.clear();
+                self.scene_bounds_hint = None;
+                self.hierarchy_tile_render_active = false;
                 self.load_state = LoadState::Failed(err.to_string());
                 self.hidden_layers.clear();
                 self.layer_draw_modes.clear();
@@ -1040,9 +1343,17 @@ impl ViewerApp {
             self.initialize_or_clamp_hierarchy_level_range(true);
         }
         self.refresh_filtered_scene_and_renderer();
-        self.hidden_layers = filter_hidden_layers_for_scene(config, &self.scene);
-        self.layer_draw_modes = filter_layer_draw_modes_for_scene(config, &self.scene);
-        self.layer_hatch_styles = filter_layer_hatch_styles_for_scene(config, &self.scene);
+        if self.layout_bundle.is_some() {
+            self.hidden_layers = filter_hidden_layers_for_layer_ids(config, &self.scene_layer_ids);
+            self.layer_draw_modes =
+                filter_layer_draw_modes_for_layer_ids(config, &self.scene_layer_ids);
+            self.layer_hatch_styles =
+                filter_layer_hatch_styles_for_layer_ids(config, &self.scene_layer_ids);
+        } else {
+            self.hidden_layers = filter_hidden_layers_for_scene(config, &self.scene);
+            self.layer_draw_modes = filter_layer_draw_modes_for_scene(config, &self.scene);
+            self.layer_hatch_styles = filter_layer_hatch_styles_for_scene(config, &self.scene);
+        }
         self.sync_layer_hatch_styles_with_scene();
         self.refresh_filtered_scene_and_renderer();
         self.camera.set_state(
@@ -1152,6 +1463,8 @@ impl ViewerApp {
                     &self.load_state,
                     &self.scene_bundle,
                     &self.scene,
+                    &self.scene_layer_ids,
+                    self.scene_bounds_hint,
                     self.available_max_hierarchy_level,
                     &self.camera,
                     &self.hidden_layers,
@@ -1755,6 +2068,33 @@ mod tests {
         assert_eq!(min_level, 0);
         assert_eq!(max_level, 2);
         assert_eq!(max_level_selected, 1);
+    }
+
+    #[test]
+    fn large_layout_range_switches_to_direct_hierarchy_tile_render_mode() {
+        let layout_bundle = sample_large_repetition_bundle();
+        let mut app = ViewerApp::new();
+        app.layout_bundle = Some(layout_bundle.clone());
+        app.scene_bundle = ViewerApp::placeholder_scene_bundle_from_layout_bundle(&layout_bundle);
+        app.refresh_available_hierarchy_level_limit();
+        app.min_hierarchy_level = 0;
+        app.max_hierarchy_level = 2;
+        app.hierarchy_level_range_initialized = true;
+
+        app.refresh_filtered_scene_and_renderer();
+
+        assert!(app.hierarchy_tile_render_active);
+        assert!(app.scene.shapes().is_empty());
+        assert_eq!(
+            app.scene_layer_ids,
+            vec![sample_layer(30), sample_layer(31), sample_layer(32)]
+        );
+        assert_eq!(
+            app.scene_bounds_hint,
+            layout_bundle
+                .selected_root_cell()
+                .and_then(|cell| cell.local_bounds())
+        );
     }
 
     #[test]

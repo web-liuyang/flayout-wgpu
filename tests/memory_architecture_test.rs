@@ -230,6 +230,36 @@ fn hierarchical_layout_bundle_exposes_selected_root_metadata_without_flat_scene(
 }
 
 #[test]
+fn view_builder_can_filter_single_layer() {
+    let root_id = LayoutCellId::new(1);
+    let layer_a = sample_layer(10, 0);
+    let layer_b = sample_layer(11, 0);
+    let root = Arc::new(LayoutCell::new(
+        root_id,
+        "root",
+        vec![
+            LayoutShape::rectangle(layer_a, Bounds::new(0.0, 0.0, 10.0, 10.0)),
+            LayoutShape::rectangle(layer_b, Bounds::new(20.0, 0.0, 30.0, 10.0)),
+        ],
+        vec![],
+    ));
+    let bundle = LayoutBundle::new(
+        vec![root],
+        vec![LayoutView::new(LayoutViewMetadata::new("root", root_id))],
+    )
+    .expect("bundle");
+
+    let scene = build_layout_view_scene(
+        &bundle,
+        LayoutViewBuildOptions::new(root_id, 0, 0).with_layer_filter(Some(layer_b)),
+    )
+    .expect("scene");
+
+    assert_eq!(scene.stats().shape_count, 1);
+    assert_eq!(scene.shapes()[0].layer, layer_b);
+}
+
+#[test]
 fn view_builder_expands_only_requested_hierarchy_levels() {
     let root_id = LayoutCellId::new(100);
     let child_id = LayoutCellId::new(101);
